@@ -1,0 +1,259 @@
+package transport
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"strings"
+	"testing"
+
+	"golang.org/x/crypto/ssh"
+)
+
+// startTestSSHServer runs a minimal in-process SSH server (real wire
+// protocol, via the same golang.org/x/crypto/ssh this package's client
+// uses) that accepts password auth for user/pass and, for each "exec"
+// request, runs the command through /bin/sh — exactly what a real
+// sshd does — so SSH.Exec/Put/Fetch are exercised end to end without
+// needing a system sshd or root.
+func startTestSSHServer(t *testing.T, user, pass string) (addr string, stop func()) {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerFromKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	config := &ssh.ServerConfig{
+		PasswordCallback: func(c ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+			if c.User() == user && string(password) == pass {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("denied")
+		},
+	}
+	config.AddHostKey(signer)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		for {
+			nc, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go serveTestSSHConn(t, nc, config)
+		}
+	}()
+
+	return ln.Addr().String(), func() {
+		ln.Close()
+		close(done)
+	}
+}
+
+func serveTestSSHConn(t *testing.T, nc net.Conn, config *ssh.ServerConfig) {
+	sc, chans, reqs, err := ssh.NewServerConn(nc, config)
+	if err != nil {
+		return
+	}
+	defer sc.Close()
+	go ssh.DiscardRequests(reqs)
+
+	for newChan := range chans {
+		if newChan.ChannelType() != "session" {
+			newChan.Reject(ssh.UnknownChannelType, "unsupported")
+			continue
+		}
+		channel, requests, err := newChan.Accept()
+		if err != nil {
+			return
+		}
+		go func() {
+			defer channel.Close()
+			for req := range requests {
+				if req.Type != "exec" {
+					if req.WantReply {
+						req.Reply(false, nil)
+					}
+					continue
+				}
+				var payload struct{ Command string }
+				ssh.Unmarshal(req.Payload, &payload)
+				if req.WantReply {
+					req.Reply(true, nil)
+				}
+
+				cmd := exec.Command("/bin/sh", "-c", payload.Command)
+				cmd.Stdin = channel
+				var stdout, stderr bytes.Buffer
+				cmd.Stdout = &stdout
+				cmd.Stderr = &stderr
+				runErr := cmd.Run()
+
+				io.Copy(channel, &stdout)
+				io.Copy(channel.Stderr(), &stderr)
+
+				exitCode := 0
+				if runErr != nil {
+					if ee, ok := runErr.(*exec.ExitError); ok {
+						exitCode = ee.ExitCode()
+					}
+				}
+				channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(exitCode)}))
+				return
+			}
+		}()
+	}
+}
+
+func dialTestServer(t *testing.T, addr, user, pass string) *SSH {
+	t.Helper()
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var port int
+	fmt.Sscanf(portStr, "%d", &port)
+
+	conn, err := DialSSH(context.Background(), SSHConfig{
+		Host:         host,
+		Port:         port,
+		User:         user,
+		Password:     pass,
+		HostKeyCheck: false,
+	})
+	if err != nil {
+		t.Fatalf("DialSSH: %v", err)
+	}
+	return conn
+}
+
+func TestSSHExec(t *testing.T) {
+	addr, stop := startTestSSHServer(t, "tester", "secret")
+	defer stop()
+
+	conn := dialTestServer(t, addr, "tester", "secret")
+	defer conn.Close()
+
+	res, err := conn.Exec(context.Background(), "echo hello", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(res.Stdout) != "hello" {
+		t.Errorf("stdout = %q", res.Stdout)
+	}
+	if res.RC != 0 {
+		t.Errorf("rc = %d", res.RC)
+	}
+}
+
+func TestSSHExecNonZeroExit(t *testing.T) {
+	addr, stop := startTestSSHServer(t, "tester", "secret")
+	defer stop()
+
+	conn := dialTestServer(t, addr, "tester", "secret")
+	defer conn.Close()
+
+	res, err := conn.Exec(context.Background(), "exit 7", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RC != 7 {
+		t.Errorf("rc = %d, want 7", res.RC)
+	}
+}
+
+func TestSSHWrongPasswordRejected(t *testing.T) {
+	addr, stop := startTestSSHServer(t, "tester", "secret")
+	defer stop()
+
+	host, portStr, _ := net.SplitHostPort(addr)
+	var port int
+	fmt.Sscanf(portStr, "%d", &port)
+
+	_, err := DialSSH(context.Background(), SSHConfig{
+		Host: host, Port: port, User: "tester", Password: "wrong", HostKeyCheck: false,
+	})
+	if err == nil {
+		t.Fatal("expected auth failure with wrong password")
+	}
+}
+
+func TestSSHPutFetch(t *testing.T) {
+	addr, stop := startTestSSHServer(t, "tester", "secret")
+	defer stop()
+
+	conn := dialTestServer(t, addr, "tester", "secret")
+	defer conn.Close()
+
+	dir := t.TempDir()
+	src := dir + "/src.txt"
+	dst := dir + "/dst.txt"
+	if err := writeFile(src, "roundtrip payload"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := conn.Put(context.Background(), src, dst, PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	fetched := dir + "/fetched.txt"
+	if err := conn.Fetch(context.Background(), dst, fetched); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := readFile(fetched)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data != "roundtrip payload" {
+		t.Errorf("fetched = %q", data)
+	}
+}
+
+func TestSSHBecomeOverRealSession(t *testing.T) {
+	addr, stop := startTestSSHServer(t, "tester", "secret")
+	defer stop()
+
+	raw := dialTestServer(t, addr, "tester", "secret")
+	defer raw.Close()
+
+	// No real sudo/su on the test server's shell needed: this proves
+	// the become wrapper's marker-stripping works over a genuine SSH
+	// session by using a become method whose "escalation program" is
+	// just /bin/sh itself succeeding immediately (sudo -n as root
+	// running the test's own uid — many CI containers run as root,
+	// where sudo -n succeeds trivially; skip otherwise).
+	conn := Become(raw, BecomeConfig{Method: BecomeSudo, User: "root"})
+	res, err := conn.Exec(context.Background(), "echo over-ssh", nil)
+	if err != nil {
+		t.Skipf("sudo -n not usable against the test server's shell: %v", err)
+	}
+	if strings.TrimSpace(res.Stdout) != "over-ssh" {
+		t.Errorf("stdout = %q", res.Stdout)
+	}
+}
+
+func writeFile(path, content string) error {
+	return os.WriteFile(path, []byte(content), 0o644)
+}
+
+func readFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	return string(data), err
+}
