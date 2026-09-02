@@ -37,6 +37,10 @@ type SSHConfig struct {
 	// Defaults to /tmp.
 	TempDir string
 
+	// TTY requests a pseudo-terminal for every Exec (best-effort: a
+	// server that refuses it does not fail the command).
+	TTY bool
+
 	Timeout time.Duration // default 30s
 
 	// Dialer establishes the transport-level TCP connection. Defaults
@@ -50,6 +54,7 @@ type SSHConfig struct {
 type SSH struct {
 	client  *ssh.Client
 	tempDir string
+	tty     bool
 }
 
 // DialSSH connects and authenticates to cfg.Host, trying (in order)
@@ -123,7 +128,7 @@ func DialSSH(ctx context.Context, cfg SSHConfig) (*SSH, error) {
 		conn.Close()
 		return nil, fmt.Errorf("transport: ssh handshake with %s: %w", addr, err)
 	}
-	return &SSH{client: ssh.NewClient(sshConn, chans, reqs), tempDir: cfg.TempDir}, nil
+	return &SSH{client: ssh.NewClient(sshConn, chans, reqs), tempDir: cfg.TempDir, tty: cfg.TTY}, nil
 }
 
 func sshHostKeyCallback(cfg SSHConfig) (ssh.HostKeyCallback, error) {
@@ -158,6 +163,12 @@ func (s *SSH) Exec(ctx context.Context, cmd string, stdin io.Reader) (Result, er
 		return Result{}, fmt.Errorf("transport: opening ssh session: %w", err)
 	}
 	defer session.Close()
+
+	if s.tty {
+		// Best-effort PTY; a server that refuses it must not fail the
+		// command.
+		_ = session.RequestPty("xterm", 24, 80, ssh.TerminalModes{})
+	}
 
 	var stdout, stderr bytes.Buffer
 	session.Stdin = stdin

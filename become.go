@@ -104,7 +104,7 @@ func (b *becomeConnection) Exec(ctx context.Context, cmd string, stdin io.Reader
 // the bytes (if any) that must be written to its stdin before anything
 // else — the become password, newline-terminated.
 func (c BecomeConfig) wrapCommand(inner string) (cmdLine string, stdin string) {
-	sh := fmt.Sprintf("/bin/sh -c %s", shellQuote(inner))
+	sh := fmt.Sprintf("sh -c %s", shellQuote(inner))
 
 	switch c.Method {
 	case BecomeSu:
