@@ -59,7 +59,7 @@ type WinRMConfig struct {
 	// NewDoer builds the HTTP client used to reach the target. Defaults
 	// to buildWinRMClient(cfg). Tests inject a doer that reaches an
 	// in-process WS-Man server.
-	NewDoer func(WinRMConfig) (httpDoer, error)
+	NewDoer func(WinRMConfig) (HTTPDoer, error)
 }
 
 func (c *WinRMConfig) setDefaults() {
@@ -104,14 +104,14 @@ func (c WinRMConfig) authBasic() bool {
 	return c.Transport == "basic" || c.Transport == "negotiate"
 }
 
-// httpDoer is the seam through which WinRM performs HTTP requests. The
+// HTTPDoer is the seam through which WinRM performs HTTP requests. The
 // default implementation is an *http.Client; tests inject a fake.
-type httpDoer interface {
+type HTTPDoer interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
 // buildWinRMClient builds the default HTTP client for a resolved config.
-func buildWinRMClient(c WinRMConfig) (httpDoer, error) {
+func buildWinRMClient(c WinRMConfig) (HTTPDoer, error) {
 	switch c.Transport {
 	case "negotiate", "basic", "ssl":
 	default:
@@ -159,7 +159,7 @@ func buildWinRMClient(c WinRMConfig) (httpDoer, error) {
 // opened at Dial time and reused across every Exec/Put/Fetch/Remove
 // until Close.
 type WinRM struct {
-	doer     httpDoer
+	doer     HTTPDoer
 	cfg      WinRMConfig
 	endpoint string
 	shellID  string

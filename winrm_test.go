@@ -23,7 +23,7 @@ func dialFakeWinRM(t *testing.T, f *fakeWSMan) *WinRM {
 		Port: port,
 		User: "tester",
 		SSL:  false,
-		NewDoer: func(WinRMConfig) (httpDoer, error) {
+		NewDoer: func(WinRMConfig) (HTTPDoer, error) {
 			return f.srv.Client(), nil
 		},
 	})
@@ -161,7 +161,7 @@ func TestWinRMBasicAuthRejected(t *testing.T) {
 
 	_, err := DialWinRM(context.Background(), WinRMConfig{
 		Host: host, Port: port, User: "admin", Password: "wrong", Transport: "basic", SSL: false,
-		NewDoer: func(c WinRMConfig) (httpDoer, error) { return f.srv.Client(), nil },
+		NewDoer: func(c WinRMConfig) (HTTPDoer, error) { return f.srv.Client(), nil },
 	})
 	// The dial itself opens a shell, which will hit the 401 — expect an error.
 	if err == nil {
@@ -198,7 +198,7 @@ func TestWinRMEnvironmentAtShellCreate(t *testing.T) {
 	w, err := DialWinRM(context.Background(), WinRMConfig{
 		Host: host, Port: port, User: "tester", SSL: false,
 		Environment: map[string]string{"PT_name": "alice", "PT_id": "7"},
-		NewDoer:     func(WinRMConfig) (httpDoer, error) { return f.srv.Client(), nil },
+		NewDoer:     func(WinRMConfig) (HTTPDoer, error) { return f.srv.Client(), nil },
 	})
 	if err != nil {
 		t.Fatal(err)
