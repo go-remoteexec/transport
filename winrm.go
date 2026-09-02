@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -48,6 +49,12 @@ type WinRMConfig struct {
 	ConnectTimeout time.Duration // default 60s
 	TempDir        string        // default `C:\Windows\Temp`
 	Path           string        // WS-Man endpoint path, default "/wsman"
+
+	// Environment is set on the shell at creation time (the WS-Man
+	// protocol's own Environment block), so every Exec/ExecArgv on this
+	// connection sees these variables — e.g. Bolt's PT_-prefixed task
+	// parameters for the "environment" input method.
+	Environment map[string]string
 
 	// NewDoer builds the HTTP client used to reach the target. Defaults
 	// to buildWinRMClient(cfg). Tests inject a doer that reaches an
@@ -195,7 +202,17 @@ const (
 )
 
 func (w *WinRM) openShell() error {
-	body := "<rsp:Shell>" +
+	envBlock := ""
+	if len(w.cfg.Environment) > 0 {
+		var b strings.Builder
+		b.WriteString("<rsp:Environment>")
+		for _, k := range sortedStringKeys(w.cfg.Environment) {
+			fmt.Fprintf(&b, "<rsp:Variable Name=%q>%s</rsp:Variable>", k, winrmEsc(w.cfg.Environment[k]))
+		}
+		b.WriteString("</rsp:Environment>")
+		envBlock = b.String()
+	}
+	body := "<rsp:Shell>" + envBlock +
 		"<rsp:InputStreams>stdin</rsp:InputStreams>" +
 		"<rsp:OutputStreams>stdout stderr</rsp:OutputStreams>" +
 		"</rsp:Shell>"
@@ -294,8 +311,21 @@ func (w *WinRM) run(command string, args []string, stdin string) (string, string
 	return stdout, stderr, code, err
 }
 
-// Exec runs cmd through cmd.exe /c on the target's open shell.
+// Exec runs cmd through cmd.exe /c on the target's open shell. cmd is
+// parsed by cmd.exe itself, with its own quoting rules; a caller that
+// already has a program and a clean argv (no cmd.exe requoting wanted —
+// e.g. running an uploaded executable with arguments that may contain
+// spaces or quotes) should use [WinRM.ExecArgv] instead.
 func (w *WinRM) Exec(ctx context.Context, cmd string, stdin io.Reader) (Result, error) {
+	return w.ExecArgv(ctx, "cmd.exe", []string{"/c", cmd}, stdin)
+}
+
+// ExecArgv runs command with args as the WS-Man protocol's own Command
+// and Arguments elements — no cmd.exe requoting layer, so each argument
+// reaches the target byte for byte regardless of embedded spaces or
+// quotes. Prefer this over Exec whenever the caller already has a
+// program and a clean argv.
+func (w *WinRM) ExecArgv(ctx context.Context, command string, args []string, stdin io.Reader) (Result, error) {
 	var in string
 	if stdin != nil {
 		data, err := io.ReadAll(stdin)
@@ -304,7 +334,7 @@ func (w *WinRM) Exec(ctx context.Context, cmd string, stdin io.Reader) (Result, 
 		}
 		in = string(data)
 	}
-	stdout, stderr, code, err := w.run("cmd.exe", []string{"/c", cmd}, in)
+	stdout, stderr, code, err := w.run(command, args, in)
 	if err != nil {
 		return Result{}, fmt.Errorf("transport: winrm exec: %w", err)
 	}
@@ -546,4 +576,13 @@ func winrmNewUUID() string {
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+func sortedStringKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
