@@ -168,3 +168,52 @@ func TestWinRMBasicAuthRejected(t *testing.T) {
 		t.Fatal("expected auth failure")
 	}
 }
+
+func TestWinRMExecArgv(t *testing.T) {
+	f := startFakeWSMan(t, false, func(f *fakeWSMan) {
+		f.output = func(cmdline, stdin string) (string, string, int) {
+			return cmdline + "\n", "", 0
+		}
+	})
+	w := dialFakeWinRM(t, f)
+	defer w.Close()
+
+	res, err := w.ExecArgv(context.Background(), "program.exe", []string{"has space", "plain"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Stdout, "has space") || !strings.Contains(res.Stdout, "plain") {
+		t.Errorf("stdout = %q, want both raw args present untouched by cmd.exe quoting", res.Stdout)
+	}
+	if len(f.lastArgs) != 2 || f.lastArgs[0] != "has space" || f.lastArgs[1] != "plain" {
+		t.Errorf("server saw args %v, want [\"has space\" \"plain\"] as separate WS-Man Arguments elements", f.lastArgs)
+	}
+}
+
+func TestWinRMEnvironmentAtShellCreate(t *testing.T) {
+	f := startFakeWSMan(t, false, nil)
+	host, portStr := f.hostPort()
+	port, _ := strconv.Atoi(portStr)
+
+	w, err := DialWinRM(context.Background(), WinRMConfig{
+		Host: host, Port: port, User: "tester", SSL: false,
+		Environment: map[string]string{"PT_name": "alice", "PT_id": "7"},
+		NewDoer:     func(WinRMConfig) (httpDoer, error) { return f.srv.Client(), nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	want := map[string]bool{"PT_name=alice": false, "PT_id=7": false}
+	for _, p := range f.lastEnv {
+		if _, ok := want[p.Name+"="+p.Value]; ok {
+			want[p.Name+"="+p.Value] = true
+		}
+	}
+	for k, seen := range want {
+		if !seen {
+			t.Errorf("shell creation did not carry environment variable %s", k)
+		}
+	}
+}
