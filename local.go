@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -250,12 +251,18 @@ func (l *Local) Remove(ctx context.Context, remotePath string) error {
 	return nil
 }
 
+// tempPathCounter guarantees TempPath returns distinct paths across calls
+// even when the clock's resolution isn't fine enough to separate two calls
+// made back-to-back (observed on Windows CI runners).
+var tempPathCounter uint64
+
 func (l *Local) TempPath(base string) string {
 	dir := l.TempDir
 	if dir == "" {
 		dir = os.TempDir()
 	}
-	return filepath.Join(dir, fmt.Sprintf("remoteexec_%d_%s", time.Now().UnixNano(), base))
+	n := atomic.AddUint64(&tempPathCounter, 1)
+	return filepath.Join(dir, fmt.Sprintf("remoteexec_%d_%d_%s", time.Now().UnixNano(), n, base))
 }
 
 func (l *Local) Close() error { return nil }

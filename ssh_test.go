@@ -105,7 +105,11 @@ func serveTestSSHConn(t *testing.T, nc net.Conn, config *ssh.ServerConfig) {
 				// streams to the client as it is produced — exercising
 				// SSH's streaming Session honestly, not just its buffered
 				// Exec.
-				cmd := exec.Command("/bin/sh", "-c", payload.Command)
+				// Bare "sh", not "/bin/sh": this fake server is itself a
+				// local child process during the test, and Windows'
+				// os/exec LookPath doesn't treat "/" as a path separator
+				// — see the same reasoning in local.go's NewLocal.
+				cmd := exec.Command("sh", "-c", payload.Command)
 				stdinPipe, _ := cmd.StdinPipe()
 				stdoutPipe, _ := cmd.StdoutPipe()
 				stderrPipe, _ := cmd.StderrPipe()
