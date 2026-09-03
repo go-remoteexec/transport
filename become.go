@@ -30,6 +30,22 @@ type BecomeConfig struct {
 // (Ansible's own become plumbing only affects command execution, not
 // file transfer, since the transferred file is written by the
 // connection's own user and then chmod/chowned by an escalated task).
+//
+// Known gap: the wrapper returned here does not implement Streamer, even
+// when conn does. Exec's become handling works by printing a random
+// marker after escalation succeeds and slicing everything before it out
+// of the buffered result (see successMarker below) — doing the
+// equivalent safely on a live stream means scanning the stdout stream
+// for that marker in real time and only starting to hand bytes to the
+// caller once it has been seen, while still correctly forwarding a
+// become password to the escalation program's stdin ahead of the
+// wrapped command's own stdin. That is buildable, but not something to
+// get subtly wrong under time pressure, so it is deliberately left
+// undone rather than shipped half-right: conn.(transport.Streamer) on a
+// Become-wrapped connection fails the type assertion, same as WinRM.
+// Callers needing both become and a live interactive session need to
+// wait for a follow-up that implements this deliberately, or run their
+// interactive session unprivileged.
 func Become(conn Connection, cfg BecomeConfig) Connection {
 	if cfg.Method == "" {
 		cfg.Method = BecomeSudo

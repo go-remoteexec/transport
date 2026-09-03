@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -193,6 +194,99 @@ func (s *SSH) Exec(ctx context.Context, cmd string, stdin io.Reader) (Result, er
 		}
 		return Result{Stdout: stdout.String(), Stderr: stderr.String(), RC: rc}, nil
 	}
+}
+
+// NewSession opens a live streaming session over a fresh *ssh.Session on
+// the already-dialed client, implementing Streamer. TTY is honored the
+// same best-effort way Exec honors it: a RequestPty before Start, ignored
+// if the server refuses it.
+func (s *SSH) NewSession(ctx context.Context) (Session, error) {
+	session, err := s.client.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("transport: opening ssh session: %w", err)
+	}
+	if s.tty {
+		_ = session.RequestPty("xterm", 24, 80, ssh.TerminalModes{})
+	}
+	return &sshSession{session: session, ctx: ctx, stopWatch: make(chan struct{})}, nil
+}
+
+// sshSession adapts a real *ssh.Session (whose StdinPipe/StdoutPipe/
+// StderrPipe/Start/Wait/Close already match Session's shape almost
+// exactly) to the Session interface, additionally watching ctx so a
+// caller's cancellation kills the remote process the same way Exec's
+// ctx.Done handling does.
+type sshSession struct {
+	session *ssh.Session
+	ctx     context.Context
+
+	once      sync.Once
+	stopWatch chan struct{}
+}
+
+func (s *sshSession) StdinPipe() (io.WriteCloser, error) {
+	w, err := s.session.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("transport: ssh session stdin pipe: %w", err)
+	}
+	return w, nil
+}
+
+func (s *sshSession) StdoutPipe() (io.Reader, error) {
+	r, err := s.session.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("transport: ssh session stdout pipe: %w", err)
+	}
+	return r, nil
+}
+
+func (s *sshSession) StderrPipe() (io.Reader, error) {
+	r, err := s.session.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("transport: ssh session stderr pipe: %w", err)
+	}
+	return r, nil
+}
+
+func (s *sshSession) Start(cmd string) error {
+	if err := s.session.Start(cmd); err != nil {
+		return fmt.Errorf("transport: ssh session start: %w", err)
+	}
+	go func() {
+		select {
+		case <-s.ctx.Done():
+			_ = s.session.Signal(ssh.SIGKILL)
+			_ = s.session.Close()
+		case <-s.stopWatch:
+		}
+	}()
+	return nil
+}
+
+func (s *sshSession) Wait() (int, error) {
+	err := s.session.Wait()
+	s.stop()
+
+	rc := 0
+	if err != nil {
+		if exitErr, ok := err.(*ssh.ExitError); ok {
+			rc = exitErr.ExitStatus()
+		} else {
+			return 0, fmt.Errorf("transport: ssh session wait: %w", err)
+		}
+	}
+	return rc, nil
+}
+
+// Close terminates the session (if still running) and stops the ctx
+// watcher. Safe to call after Wait, and safe to call more than once.
+func (s *sshSession) Close() error {
+	s.stop()
+	return s.session.Close()
+}
+
+func (s *sshSession) stop() {
+	s.once.Do(func() { close(s.stopWatch) })
 }
 
 // Put streams localPath's contents to remotePath over a plain `cat >`

@@ -58,6 +58,15 @@ func TestWrapCommandDefaultsToSudoRoot(t *testing.T) {
 	}
 }
 
+func TestBecomeNotAStreamer(t *testing.T) {
+	// Local itself implements Streamer; wrapping it with Become must not
+	// carry that through, per Become's documented gap.
+	conn := Become(NewLocal(), BecomeConfig{})
+	if _, ok := conn.(Streamer); ok {
+		t.Fatal("Become-wrapped connection must not implement Streamer (known, documented gap)")
+	}
+}
+
 // TestBecomeLocalPasswordlessSudo exercises the real Exec path end to
 // end against the Local connection: if this machine happens to have
 // passwordless sudo for the current user it will actually escalate; if

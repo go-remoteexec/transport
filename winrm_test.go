@@ -138,6 +138,13 @@ func TestWinRMPutFetch(t *testing.T) {
 	}
 }
 
+func TestWinRMNotAStreamer(t *testing.T) {
+	var conn Connection = &WinRM{}
+	if _, ok := conn.(Streamer); ok {
+		t.Fatal("WinRM must not implement Streamer: WS-Management's poll-based Send/Receive shell protocol doesn't map onto continuous streaming")
+	}
+}
+
 func TestWinRMTempPath(t *testing.T) {
 	w := &WinRM{cfg: WinRMConfig{TempDir: `C:\Windows\Temp`}}
 	p := w.TempPath("task.exe")
