@@ -277,6 +277,42 @@ func TestLocalStreamerCloseMidRun(t *testing.T) {
 	}
 }
 
+// TestLocalStreamerCloseWithUnclosedStdin covers a caller that requests
+// StdinPipe (as any real interactive-session caller does, to be able to
+// forward keystrokes) but never writes to or closes it — e.g. a command
+// that doesn't need input and exits on its own, or a caller closing the
+// whole session on an unrelated event (ctx cancellation, SIGINT) before
+// ever touching stdin. Close must still return promptly: Cmd.Wait blocks
+// until every one of Start's internal copy goroutines finishes, and the
+// stdin one only sees EOF once stdinW is closed — closing it after
+// reaping (the original ordering) deadlocks forever in exactly this
+// case, since nothing else will ever close it.
+func TestLocalStreamerCloseWithUnclosedStdin(t *testing.T) {
+	l := NewLocal()
+	sess, err := l.NewSession(context.Background())
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	if _, err := sess.StdinPipe(); err != nil {
+		t.Fatalf("StdinPipe: %v", err)
+	}
+	if err := sess.Start("true"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- sess.Close() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return with stdin requested but never written to or closed")
+	}
+}
+
 func TestLocalTempPath(t *testing.T) {
 	l := NewLocal()
 	a := l.TempPath("script.sh")
