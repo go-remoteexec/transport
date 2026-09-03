@@ -123,8 +123,15 @@ func serveTestSSHConn(t *testing.T, nc net.Conn, config *ssh.ServerConfig) {
 				go func() { defer copyWG.Done(); io.Copy(channel, stdoutPipe) }()
 				go func() { defer copyWG.Done(); io.Copy(channel.Stderr(), stderrPipe) }()
 
-				runErr := cmd.Wait()
+				// cmd.Wait must not run concurrently with the stdout/
+				// stderr copies above: per the os/exec docs for
+				// StdoutPipe/StderrPipe, Wait closes the underlying pipe
+				// once the process exits, and calling it before all reads
+				// have finished can truncate output that just hasn't been
+				// drained yet — fast locally, but a real, reproducible
+				// race under slow qemu emulation. Drain first, reap after.
 				copyWG.Wait()
+				runErr := cmd.Wait()
 
 				exitCode := 0
 				if runErr != nil {
