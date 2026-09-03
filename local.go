@@ -200,11 +200,29 @@ func (s *localSession) Close() error {
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
 	}
-	// Close the output readers before reaping: Cmd.Wait blocks until its
-	// internal copy goroutines finish, and those goroutines are blocked
-	// mid-write into our unbuffered io.Pipe if nothing is reading it any
-	// more — closing the reader end makes that write fail immediately
-	// instead of stalling Wait (and this Close) indefinitely.
+	// Close every pipe end before reaping, both directions: Cmd.Wait
+	// blocks until ALL of Start's internal copy goroutines finish, not
+	// just the output ones.
+	//
+	//   - stdout/stderr: that goroutine copies FROM the child INTO our
+	//     io.Pipe: closing the reader end makes a pending write fail
+	//     immediately instead of stalling forever with nothing left
+	//     reading it.
+	//   - stdin: that goroutine copies FROM our io.Pipe INTO the child —
+	//     the opposite direction — so it's blocked on a *read* from
+	//     stdinR, and killing the child does not unblock that (the
+	//     goroutine is waiting on data from us, not from the child).
+	//     Closing stdinW is what makes the pending read see io.EOF. This
+	//     one has to close BEFORE doWait for the same reason the output
+	//     pipes do: get here without it — e.g. a caller that dials,
+	//     never touches stdin, and closes — and doWait hangs forever on
+	//     a copy goroutine waiting for input that will never arrive.
+	if s.stdinW != nil {
+		_ = s.stdinW.Close()
+	}
+	if s.stdinR != nil {
+		_ = s.stdinR.Close()
+	}
 	if s.stdoutR != nil {
 		_ = s.stdoutR.Close()
 	}
@@ -213,12 +231,6 @@ func (s *localSession) Close() error {
 	}
 	if s.cmd != nil {
 		_, _ = s.doWait()
-	}
-	if s.stdinW != nil {
-		_ = s.stdinW.Close()
-	}
-	if s.stdinR != nil {
-		_ = s.stdinR.Close()
 	}
 	return nil
 }
