@@ -1,11 +1,15 @@
 package transport
 
 import (
+	"bufio"
 	"context"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLocalExec(t *testing.T) {
@@ -125,6 +129,147 @@ func TestLocalRemove(t *testing.T) {
 	// Removing an already-absent path is not an error.
 	if err := l.Remove(context.Background(), path); err != nil {
 		t.Fatalf("Remove of missing path: %v", err)
+	}
+}
+
+func TestLocalStreamerNewSession(t *testing.T) {
+	l := NewLocal()
+	var streamer Streamer = l
+	sess, err := streamer.NewSession(context.Background())
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+
+	stdin, err := sess.StdinPipe()
+	if err != nil {
+		t.Fatalf("StdinPipe: %v", err)
+	}
+	stdout, err := sess.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+
+	if err := sess.Start("cat"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// A paced write-then-read-back per line proves output arrives
+	// progressively rather than only after the whole command finishes
+	// (cat never finishes until stdin closes, so a buffered
+	// implementation would simply hang here instead of echoing).
+	lines := make(chan string)
+	errc := make(chan error, 1)
+	go func() {
+		br := bufio.NewReader(stdout)
+		for {
+			s, err := br.ReadString('\n')
+			if s != "" {
+				lines <- strings.TrimRight(s, "\n")
+			}
+			if err != nil {
+				errc <- err
+				return
+			}
+		}
+	}()
+	readLine := func() (string, error) {
+		select {
+		case s := <-lines:
+			return s, nil
+		case err := <-errc:
+			return "", err
+		case <-time.After(5 * time.Second):
+			return "", fmt.Errorf("timed out waiting for a line")
+		}
+	}
+
+	for i, line := range []string{"alpha", "beta", "gamma"} {
+		if _, err := io.WriteString(stdin, line+"\n"); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		got, err := readLine()
+		if err != nil {
+			t.Fatalf("readLine %d: %v", i, err)
+		}
+		if got != line {
+			t.Errorf("line %d = %q, want %q", i, got, line)
+		}
+	}
+	stdin.Close()
+
+	rc, err := sess.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if rc != 0 {
+		t.Errorf("rc = %d, want 0", rc)
+	}
+}
+
+func TestLocalStreamerNonZeroExit(t *testing.T) {
+	l := NewLocal()
+	sess, err := l.NewSession(context.Background())
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.Start("exit 5"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	rc, err := sess.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if rc != 5 {
+		t.Errorf("rc = %d, want 5", rc)
+	}
+}
+
+func TestLocalStreamerCloseMidRun(t *testing.T) {
+	l := NewLocal()
+	sess, err := l.NewSession(context.Background())
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	stdout, err := sess.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+
+	if err := sess.Start("echo started; sleep 30"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	buf := make([]byte, 64)
+	n, err := stdout.Read(buf)
+	if err != nil {
+		t.Fatalf("reading 'started': %v", err)
+	}
+	if strings.TrimSpace(string(buf[:n])) != "started" {
+		t.Fatalf("stdout = %q", buf[:n])
+	}
+
+	if err := sess.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Close must have killed and reaped the 30s sleep rather than leaving
+	// it running: Wait should return promptly with whatever Close
+	// already observed, not block for anywhere near 30s (and calling it
+	// after Close must not panic or hang, since Close itself has to reap
+	// the process too).
+	done := make(chan struct{})
+	go func() {
+		sess.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Wait did not return after Close killed the process")
 	}
 }
 

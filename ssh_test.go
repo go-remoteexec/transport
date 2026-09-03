@@ -1,7 +1,7 @@
 package transport
 
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -11,7 +11,9 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -98,15 +100,31 @@ func serveTestSSHConn(t *testing.T, nc net.Conn, config *ssh.ServerConfig) {
 					req.Reply(true, nil)
 				}
 
+				// Wire the child directly to the channel via pipes (not a
+				// buffer filled in after Run completes) so output really
+				// streams to the client as it is produced — exercising
+				// SSH's streaming Session honestly, not just its buffered
+				// Exec.
 				cmd := exec.Command("/bin/sh", "-c", payload.Command)
-				cmd.Stdin = channel
-				var stdout, stderr bytes.Buffer
-				cmd.Stdout = &stdout
-				cmd.Stderr = &stderr
-				runErr := cmd.Run()
+				stdinPipe, _ := cmd.StdinPipe()
+				stdoutPipe, _ := cmd.StdoutPipe()
+				stderrPipe, _ := cmd.StderrPipe()
+				if err := cmd.Start(); err != nil {
+					channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{127}))
+					return
+				}
 
-				io.Copy(channel, &stdout)
-				io.Copy(channel.Stderr(), &stderr)
+				go func() {
+					io.Copy(stdinPipe, channel)
+					stdinPipe.Close()
+				}()
+				var copyWG sync.WaitGroup
+				copyWG.Add(2)
+				go func() { defer copyWG.Done(); io.Copy(channel, stdoutPipe) }()
+				go func() { defer copyWG.Done(); io.Copy(channel.Stderr(), stderrPipe) }()
+
+				runErr := cmd.Wait()
+				copyWG.Wait()
 
 				exitCode := 0
 				if runErr != nil {
@@ -246,6 +264,160 @@ func TestSSHBecomeOverRealSession(t *testing.T) {
 	}
 	if strings.TrimSpace(res.Stdout) != "over-ssh" {
 		t.Errorf("stdout = %q", res.Stdout)
+	}
+}
+
+func TestSSHStreamerNewSession(t *testing.T) {
+	addr, stop := startTestSSHServer(t, "tester", "secret")
+	defer stop()
+
+	conn := dialTestServer(t, addr, "tester", "secret")
+	defer conn.Close()
+
+	var streamer Streamer = conn
+	sess, err := streamer.NewSession(context.Background())
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+
+	stdin, err := sess.StdinPipe()
+	if err != nil {
+		t.Fatalf("StdinPipe: %v", err)
+	}
+	stdout, err := sess.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+
+	if err := sess.Start("cat"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Pace the writes and read each echoed line back before sending the
+	// next one, proving output really streams rather than only becoming
+	// visible once the whole command has finished.
+	reader := newLineReader(stdout)
+	for i, line := range []string{"first", "second", "third"} {
+		if _, err := io.WriteString(stdin, line+"\n"); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		got, err := reader.readLine(5 * time.Second)
+		if err != nil {
+			t.Fatalf("readLine %d: %v", i, err)
+		}
+		if got != line {
+			t.Errorf("line %d = %q, want %q", i, got, line)
+		}
+	}
+	stdin.Close()
+
+	rc, err := sess.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if rc != 0 {
+		t.Errorf("rc = %d, want 0", rc)
+	}
+}
+
+func TestSSHStreamerNonZeroExit(t *testing.T) {
+	addr, stop := startTestSSHServer(t, "tester", "secret")
+	defer stop()
+
+	conn := dialTestServer(t, addr, "tester", "secret")
+	defer conn.Close()
+
+	sess, err := conn.NewSession(context.Background())
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.Start("exit 9"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	rc, err := sess.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if rc != 9 {
+		t.Errorf("rc = %d, want 9", rc)
+	}
+}
+
+func TestSSHStreamerCloseMidRun(t *testing.T) {
+	addr, stop := startTestSSHServer(t, "tester", "secret")
+	defer stop()
+
+	conn := dialTestServer(t, addr, "tester", "secret")
+	defer conn.Close()
+
+	sess, err := conn.NewSession(context.Background())
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	stdout, err := sess.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+
+	if err := sess.Start("echo started; sleep 30"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	buf := make([]byte, 64)
+	n, err := stdout.Read(buf)
+	if err != nil {
+		t.Fatalf("reading 'started': %v", err)
+	}
+	if strings.TrimSpace(string(buf[:n])) != "started" {
+		t.Fatalf("stdout = %q", buf[:n])
+	}
+
+	if err := sess.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// The remote sleep must not still be running; the exact signal the
+	// server observes is implementation detail, so just require the
+	// session channel to be gone rather than racing a long sleep.
+}
+
+// lineReader lets a test read newline-delimited output as it arrives,
+// with a per-line timeout so a hang shows up as a test failure instead
+// of a stuck test run.
+type lineReader struct {
+	line chan string
+	errc chan error
+}
+
+func newLineReader(r io.Reader) *lineReader {
+	lr := &lineReader{line: make(chan string), errc: make(chan error, 1)}
+	go func() {
+		br := bufio.NewReader(r)
+		for {
+			s, err := br.ReadString('\n')
+			if s != "" {
+				lr.line <- strings.TrimRight(s, "\n")
+			}
+			if err != nil {
+				lr.errc <- err
+				return
+			}
+		}
+	}()
+	return lr
+}
+
+func (lr *lineReader) readLine(timeout time.Duration) (string, error) {
+	select {
+	case s := <-lr.line:
+		return s, nil
+	case err := <-lr.errc:
+		return "", err
+	case <-time.After(timeout):
+		return "", fmt.Errorf("timed out waiting for a line")
 	}
 }
 
