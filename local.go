@@ -19,23 +19,34 @@ import (
 // globs) that only a shell interprets.
 type Local struct {
 	// Shell is the interpreter commands are run through. Defaults to
-	// /bin/sh.
+	// "sh" resolved via PATH.
 	Shell string
 	// TempDir is where TempPath builds paths under. Defaults to
 	// os.TempDir().
 	TempDir string
 }
 
-// NewLocal returns a Local connection using /bin/sh.
+// NewLocal returns a Local connection using "sh" resolved via PATH.
+//
+// This is deliberately the bare name "sh", not the absolute path
+// "/bin/sh": os/exec's Windows LookPath only recognizes "\" and ":" as
+// path separators, not "/", so an absolute-looking POSIX path like
+// "/bin/sh" is instead treated as a literal bare command name and searched
+// for on %PATH% — where it can never exist — failing every local exec on
+// Windows with "executable file not found in %PATH%". A bare "sh" resolves
+// correctly on both POSIX (finds /bin/sh or /usr/bin/sh via PATH) and
+// Windows (finds Git for Windows' sh.exe, which GitHub's windows-latest
+// runners — and most developer machines with Git installed — already have
+// on PATH).
 func NewLocal() *Local {
-	return &Local{Shell: "/bin/sh"}
+	return &Local{Shell: "sh"}
 }
 
 func (l *Local) shell() string {
 	if l.Shell != "" {
 		return l.Shell
 	}
-	return "/bin/sh"
+	return "sh"
 }
 
 func (l *Local) Exec(ctx context.Context, cmd string, stdin io.Reader) (Result, error) {
