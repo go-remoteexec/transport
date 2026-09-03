@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -93,6 +94,9 @@ func TestLocalPutFetch(t *testing.T) {
 }
 
 func TestLocalPutMkdirParentsAndExecutable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no POSIX executable bit; os.Chmod's mode argument is ignored beyond the read-only attribute")
+	}
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.sh")
 	if err := os.WriteFile(src, []byte("#!/bin/sh\necho hi\n"), 0o644); err != nil {
