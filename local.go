@@ -80,26 +80,41 @@ func asExitError(err error, target **exec.ExitError) bool {
 
 // NewSession opens a live streaming session for a local command,
 // implementing Streamer. The command itself is not known until Start, so
-// StdinPipe/StdoutPipe/StderrPipe (which must be usable before Start,
-// matching os/exec's own Cmd.StdinPipe/StdoutPipe/StderrPipe convention)
-// hand back io.Pipe ends now and Start wires the *exec.Cmd's Stdin/
-// Stdout/Stderr to the other ends of those same pipes — the standard way
-// to offer pre-Start pipes for a command whose argv isn't chosen yet.
+// this builds the *exec.Cmd now with an empty placeholder "-c" argument,
+// which Start fills in later — letting StdinPipe/StdoutPipe/StderrPipe
+// use os/exec's own Cmd.StdinPipe/StdoutPipe/StderrPipe (real OS pipes)
+// instead of a manually bridged io.Pipe.
+//
+// That distinction matters, and cost a real deadlock to learn: assigning
+// an arbitrary io.Reader/io.Writer to Cmd.Stdin/Stdout/Stderr makes
+// os/exec spawn its own internal copy goroutine, and Cmd.Wait blocks
+// until every one of those finishes — including the stdin one, which
+// only sees io.EOF once the write end is closed. A caller that requests
+// StdinPipe (as any real interactive session does, to be able to forward
+// keystrokes) but has no need to write anything — a command that doesn't
+// read stdin, or a caller closing the session on an unrelated event
+// before ever touching stdin — would then hang in Wait forever, since
+// nothing else ever closes that write end. Cmd's own *Pipe methods don't
+// have this problem: they hand back a real OS pipe end directly, with no
+// bridging goroutine for Wait to wait on.
 func (l *Local) NewSession(ctx context.Context) (Session, error) {
-	return &localSession{shell: l.shell(), ctx: ctx}, nil
+	cmd := exec.CommandContext(ctx, l.shell(), "-c", "")
+	// A shell command like "sleep 30" runs as a grandchild that inherits
+	// the shell's stdout/stderr fds; killing only the shell (Close does
+	// exactly that, via Process.Kill) leaves the grandchild holding those
+	// fds open, and without a bound Wait would then block draining them
+	// until the grandchild exits on its own. WaitDelay bounds that: once
+	// the process itself has been reaped, Wait force-closes any pipes
+	// still open after this long instead of hanging.
+	cmd.WaitDelay = 5 * time.Second
+	return &localSession{cmd: cmd}, nil
 }
 
 type localSession struct {
-	shell string
-	ctx   context.Context
-	cmd   *exec.Cmd
+	cmd *exec.Cmd
 
-	stdinW  *io.PipeWriter // returned to the caller
-	stdinR  *io.PipeReader // wired to cmd.Stdin
-	stdoutR *io.PipeReader // returned to the caller
-	stdoutW *io.PipeWriter // wired to cmd.Stdout
-	stderrR *io.PipeReader // returned to the caller
-	stderrW *io.PipeWriter // wired to cmd.Stderr
+	stdin          io.WriteCloser
+	stdout, stderr io.ReadCloser
 
 	// waitOnce guards cmd.Wait(), which os/exec panics if called twice —
 	// both Session.Wait and Session.Close (when it fires mid-run) need
@@ -110,54 +125,52 @@ type localSession struct {
 }
 
 func (s *localSession) StdinPipe() (io.WriteCloser, error) {
-	if s.stdinW == nil {
-		s.stdinR, s.stdinW = io.Pipe()
+	if s.stdin == nil {
+		w, err := s.cmd.StdinPipe()
+		if err != nil {
+			return nil, fmt.Errorf("transport: local session stdin pipe: %w", err)
+		}
+		s.stdin = w
 	}
-	return s.stdinW, nil
+	return s.stdin, nil
 }
 
 func (s *localSession) StdoutPipe() (io.Reader, error) {
-	if s.stdoutR == nil {
-		s.stdoutR, s.stdoutW = io.Pipe()
+	if s.stdout == nil {
+		r, err := s.cmd.StdoutPipe()
+		if err != nil {
+			return nil, fmt.Errorf("transport: local session stdout pipe: %w", err)
+		}
+		s.stdout = r
 	}
-	return s.stdoutR, nil
+	return s.stdout, nil
 }
 
 func (s *localSession) StderrPipe() (io.Reader, error) {
-	if s.stderrR == nil {
-		s.stderrR, s.stderrW = io.Pipe()
+	if s.stderr == nil {
+		r, err := s.cmd.StderrPipe()
+		if err != nil {
+			return nil, fmt.Errorf("transport: local session stderr pipe: %w", err)
+		}
+		s.stderr = r
 	}
-	return s.stderrR, nil
+	return s.stderr, nil
 }
 
 func (s *localSession) Start(cmd string) error {
-	c := exec.CommandContext(s.ctx, s.shell, "-c", cmd)
-	// A shell command like "sleep 30" runs as a grandchild that inherits
-	// the shell's stdout/stderr fds; killing only the shell (Close does
-	// exactly that, via Process.Kill) leaves the grandchild holding
-	// those fds open, and without a bound Wait would then block on
-	// draining them until the grandchild exits on its own. WaitDelay
-	// bounds that: once the process itself has been reaped, Wait force-
-	// closes any pipes still open after this long instead of hanging.
-	c.WaitDelay = 5 * time.Second
-	if s.stdinR != nil {
-		c.Stdin = s.stdinR
-	}
-	if s.stdoutW != nil {
-		c.Stdout = s.stdoutW
-	}
-	if s.stderrW != nil {
-		c.Stderr = s.stderrW
-	}
-	s.cmd = c
-	if err := c.Start(); err != nil {
+	// Fill in the placeholder "-c" argument NewSession left empty — the
+	// command itself wasn't known until now, but StdinPipe/StdoutPipe/
+	// StderrPipe had to be callable before Start, so the *exec.Cmd was
+	// already built.
+	s.cmd.Args[len(s.cmd.Args)-1] = cmd
+	if err := s.cmd.Start(); err != nil {
 		return fmt.Errorf("transport: local session start: %w", err)
 	}
 	return nil
 }
 
 func (s *localSession) Wait() (int, error) {
-	if s.cmd == nil {
+	if s.cmd.Process == nil {
 		return 0, fmt.Errorf("transport: local session Wait called before Start")
 	}
 	return s.doWait()
@@ -170,16 +183,6 @@ func (s *localSession) Wait() (int, error) {
 func (s *localSession) doWait() (int, error) {
 	s.waitOnce.Do(func() {
 		err := s.cmd.Wait()
-		// Cmd.Wait only returns once its internal copy-to-c.Stdout/
-		// Stderr goroutines finish, which for an io.Pipe writer means a
-		// reader has drained it — closing the writer ends here lets a
-		// caller's final Read see io.EOF rather than hang.
-		if s.stdoutW != nil {
-			s.stdoutW.Close()
-		}
-		if s.stderrW != nil {
-			s.stderrW.Close()
-		}
 		if err == nil {
 			return
 		}
@@ -193,43 +196,17 @@ func (s *localSession) doWait() (int, error) {
 	return s.waitRC, s.waitErr
 }
 
-// Close terminates the process (if still running) and releases the
-// session's pipes. Safe to call after Wait, and safe to call more than
-// once.
+// Close terminates the process (if still running) and reaps it. Safe to
+// call after Wait, and safe to call more than once. It does not need to
+// close the session's pipes itself: since StdinPipe/StdoutPipe/StderrPipe
+// are real os/exec pipes rather than a manually bridged io.Pipe, Cmd.Wait
+// (via doWait, above) already closes them on the way out — that is
+// exactly the deadlock NewSession's doc comment describes avoiding.
 func (s *localSession) Close() error {
-	if s.cmd != nil && s.cmd.Process != nil {
+	if s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
 	}
-	// Close every pipe end before reaping, both directions: Cmd.Wait
-	// blocks until ALL of Start's internal copy goroutines finish, not
-	// just the output ones.
-	//
-	//   - stdout/stderr: that goroutine copies FROM the child INTO our
-	//     io.Pipe: closing the reader end makes a pending write fail
-	//     immediately instead of stalling forever with nothing left
-	//     reading it.
-	//   - stdin: that goroutine copies FROM our io.Pipe INTO the child —
-	//     the opposite direction — so it's blocked on a *read* from
-	//     stdinR, and killing the child does not unblock that (the
-	//     goroutine is waiting on data from us, not from the child).
-	//     Closing stdinW is what makes the pending read see io.EOF. This
-	//     one has to close BEFORE doWait for the same reason the output
-	//     pipes do: get here without it — e.g. a caller that dials,
-	//     never touches stdin, and closes — and doWait hangs forever on
-	//     a copy goroutine waiting for input that will never arrive.
-	if s.stdinW != nil {
-		_ = s.stdinW.Close()
-	}
-	if s.stdinR != nil {
-		_ = s.stdinR.Close()
-	}
-	if s.stdoutR != nil {
-		_ = s.stdoutR.Close()
-	}
-	if s.stderrR != nil {
-		_ = s.stderrR.Close()
-	}
-	if s.cmd != nil {
+	if s.cmd.Process != nil {
 		_, _ = s.doWait()
 	}
 	return nil
