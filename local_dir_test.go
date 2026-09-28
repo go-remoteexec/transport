@@ -1,7 +1,9 @@
 package transport
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -101,5 +103,50 @@ func TestLocalDirResolvesRelativeRemotePaths(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, abs)); err == nil {
 		t.Error("an absolute remote path was joined onto Dir")
+	}
+}
+
+// TestLocalDirAppliesToASession pins Dir on the streaming path too. It
+// is here because a neuter removing `cmd.Dir = l.Dir` from NewSession
+// PASSED: Dir was set there and nothing looked.
+func TestLocalDirAppliesToASession(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "marker.txt"), []byte("here"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	l := NewLocal()
+	l.Dir = dir
+	sess, err := l.NewSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	stdout, err := sess.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.Start("cat marker.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Drained before Wait: a session's output has to be read while the
+	// command runs, not after it.
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, stdout)
+		done <- buf.String()
+	}()
+	rc, err := sess.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if rc != 0 {
+		t.Fatalf("rc = %d, want 0 -- the session did not run in Dir", rc)
+	}
+	if got := strings.TrimSpace(<-done); got != "here" {
+		t.Errorf("stdout = %q, want %q -- a session must run in Dir too", got, "here")
 	}
 }
