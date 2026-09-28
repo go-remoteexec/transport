@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -439,4 +440,47 @@ func writeFile(path, content string) error {
 func readFile(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	return string(data), err
+}
+
+// ⭐ THE SAME CONTRACT, ASKED OF THE OTHER IMPLEMENTATION. Local lost a
+// session's output when Wait reaped the process (os/exec closes the pipes it
+// hands out), and fixing only Local would leave callers with a promise that
+// holds for one transport and not the other -- which is worse than a promise
+// that holds for neither, because nothing tells them which they have.
+func TestSSHSessionsOutputSurvivesTheReap(t *testing.T) {
+	addr, stop := startTestSSHServer(t, "tester", "secret")
+	defer stop()
+
+	conn := dialTestServer(t, addr, "tester", "secret")
+	defer conn.Close()
+
+	sess, err := conn.NewSession(context.Background())
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+
+	stdout, err := sess.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+	if err := sess.Start("echo surviving"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	rc, err := sess.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if rc != 0 {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+
+	// Nothing has read a byte yet, and the command is already reaped.
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, stdout); err != nil {
+		t.Fatalf("reading after Wait: %v", err)
+	}
+	if got := strings.TrimSpace(buf.String()); got != "surviving" {
+		t.Errorf("stdout after Wait = %q, want %q -- the reap ate the output", got, "surviving")
+	}
 }

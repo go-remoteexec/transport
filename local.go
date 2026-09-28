@@ -134,6 +134,11 @@ type localSession struct {
 	stdin          io.WriteCloser
 	stdout, stderr io.ReadCloser
 
+	// childOut and childErr are the parent's copies of the WRITE ends. They
+	// must be closed once the child owns them, or the reader never reaches
+	// EOF: the pipe stays open because this process is still holding it.
+	childOut, childErr io.Closer
+
 	// waitOnce guards cmd.Wait(), which os/exec panics if called twice —
 	// both Session.Wait and Session.Close (when it fires mid-run) need
 	// to reap the process, so both funnel through doWait.
@@ -153,24 +158,48 @@ func (s *localSession) StdinPipe() (io.WriteCloser, error) {
 	return s.stdin, nil
 }
 
+// ⛔⛔ OUR OWN PIPE, NOT Cmd.StdoutPipe. os/exec closes the pipes it hands out
+// as soon as it reaps the process -- "it is incorrect to call Wait before all
+// reads from the pipe have completed" -- so whatever the child wrote and the
+// reader has not yet consumed is DISCARDED. A Session cannot offer that: the
+// caller reads on its own schedule, and a command that exits before the reader
+// is scheduled loses everything it printed.
+//
+// It is not theoretical. TestLocalDirAppliesToASession drains concurrently,
+// exactly as the documentation asks, and still failed on the riscv64 lane on
+// 2026-09-28 with stdout = "" and rc = 0: the command ran, wrote, exited, and
+// the reader never got a turn under qemu. Under an emulator the window is wide
+// enough to hit every time; on real hardware it is a flake waiting for a busy
+// machine.
+//
+// ⭐ AND THIS DOES NOT REOPEN #10's DEADLOCK, which is why the pipe is an
+// *os.File and not an io.Pipe. os/exec spawns an internal copy goroutine only
+// for a Stdout/Stderr/Stdin that is NOT an *os.File, and Cmd.Wait blocks on
+// every one of those -- including the stdin one, which never finishes until the
+// write end closes. An *os.File is handed to the child as a file descriptor
+// with no goroutine behind it, so Wait has nothing to block on and nothing to
+// close out from under us.
+//
+// Stdin stays on Cmd.StdinPipe: there the reap-closes-it behaviour is exactly
+// what is wanted, and there is no output to lose.
 func (s *localSession) StdoutPipe() (io.Reader, error) {
 	if s.stdout == nil {
-		r, err := s.cmd.StdoutPipe()
+		r, w, err := os.Pipe()
 		if err != nil {
 			return nil, fmt.Errorf("transport: local session stdout pipe: %w", err)
 		}
-		s.stdout = r
+		s.cmd.Stdout, s.childOut, s.stdout = w, w, r
 	}
 	return s.stdout, nil
 }
 
 func (s *localSession) StderrPipe() (io.Reader, error) {
 	if s.stderr == nil {
-		r, err := s.cmd.StderrPipe()
+		r, w, err := os.Pipe()
 		if err != nil {
 			return nil, fmt.Errorf("transport: local session stderr pipe: %w", err)
 		}
-		s.stderr = r
+		s.cmd.Stderr, s.childErr, s.stderr = w, w, r
 	}
 	return s.stderr, nil
 }
@@ -183,6 +212,14 @@ func (s *localSession) Start(cmd string) error {
 	s.cmd.Args[len(s.cmd.Args)-1] = cmd
 	if err := s.cmd.Start(); err != nil {
 		return fmt.Errorf("transport: local session start: %w", err)
+	}
+	// The child has the write ends now. Ours would otherwise hold the pipes
+	// open for ever and a reader would block at EOF that never comes.
+	if s.childOut != nil {
+		_ = s.childOut.Close()
+	}
+	if s.childErr != nil {
+		_ = s.childErr.Close()
 	}
 	return nil
 }
@@ -226,6 +263,15 @@ func (s *localSession) Close() error {
 	}
 	if s.cmd.Process != nil {
 		_, _ = s.doWait()
+	}
+	// ⚠ The READ ends are ours to close, and only here. Cmd.Wait no longer
+	// does it, which is the whole point -- but a session nobody drained would
+	// otherwise leak two descriptors per call.
+	if c, ok := s.stdout.(io.Closer); ok && c != nil {
+		_ = c.Close()
+	}
+	if c, ok := s.stderr.(io.Closer); ok && c != nil {
+		_ = c.Close()
 	}
 	return nil
 }
