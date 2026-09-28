@@ -10,35 +10,41 @@ import (
 
 // TestLocalDirSetsTheWorkingDirectory pins what Dir is for: a command
 // runs THERE, not in the process's own working directory.
+//
+// It asserts the CONSEQUENCE -- a relative name in the command resolves
+// under Dir -- rather than comparing `pwd` against a Go path. Those
+// disagree by construction on Windows, where the shell is Git for
+// Windows' sh and prints MSYS paths like /c/Users/... that Go's own
+// path functions cannot resolve. The first version of this test did
+// compare them, and failed on windows-latest for exactly that reason.
 func TestLocalDirSetsTheWorkingDirectory(t *testing.T) {
 	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "marker.txt"), []byte("here"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	l := NewLocal()
 	l.Dir = dir
-
-	res, err := l.Exec(context.Background(), "pwd", nil)
+	res, err := l.Exec(context.Background(), "cat marker.txt", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// macOS hands out /var/folders/... paths that are a symlink to
-	// /private/var/..., and the shell's pwd prints the LOGICAL path it
-	// was given. Resolving BOTH sides is what makes this compare
-	// directories rather than spellings.
-	if got, want := realPath(t, strings.TrimSpace(res.Stdout)), realPath(t, dir); got != want {
-		t.Errorf("pwd = %q, want %q", got, want)
+	if res.RC != 0 {
+		t.Fatalf("rc = %d, want 0 -- the command did not run in Dir (stderr: %s)", res.RC, res.Stderr)
+	}
+	if got := strings.TrimSpace(res.Stdout); got != "here" {
+		t.Errorf("stdout = %q, want %q -- a relative name must resolve under Dir", got, "here")
 	}
 
-	// Unset Dir keeps the old behaviour: the process's own directory.
+	// With no Dir the same command runs in the process's own
+	// directory, where that file does not exist.
 	plain := NewLocal()
-	res, err = plain.Exec(context.Background(), "pwd", nil)
+	res, err = plain.Exec(context.Background(), "cat marker.txt", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := realPath(t, strings.TrimSpace(res.Stdout)), realPath(t, cwd); got != want {
-		t.Errorf("with no Dir, pwd = %q, want the process cwd %q", got, want)
+	if res.RC == 0 {
+		t.Errorf("with no Dir the command succeeded; it must run in the process directory, where marker.txt is absent")
 	}
 }
 
@@ -96,13 +102,4 @@ func TestLocalDirResolvesRelativeRemotePaths(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, abs)); err == nil {
 		t.Error("an absolute remote path was joined onto Dir")
 	}
-}
-
-func realPath(t *testing.T, path string) string {
-	t.Helper()
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		t.Fatalf("resolving %q: %v", path, err)
-	}
-	return resolved
 }
