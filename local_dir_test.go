@@ -150,3 +150,50 @@ func TestLocalDirAppliesToASession(t *testing.T) {
 		t.Errorf("stdout = %q, want %q -- a session must run in Dir too", got, "here")
 	}
 }
+
+// ⛔⛔ THE BYTES SURVIVE THE REAP. os/exec's StdoutPipe is documented as "it is
+// incorrect to call Wait before all reads from the pipe have completed" --
+// Wait closes the pipe, and whatever the child wrote but the reader has not
+// consumed is gone. That is not a contract a Session can offer: a caller reads
+// on its own schedule, and a fast command that exits before the reader is
+// scheduled loses everything.
+//
+// It is not theoretical. TestLocalDirAppliesToASession drains concurrently,
+// exactly as the documentation asks, and still failed on the riscv64 lane on
+// 2026-09-28 with stdout = "" and rc = 0: the command ran, wrote, exited, and
+// the reader was never scheduled in time under qemu.
+//
+// So this reads AFTER Wait, which is the strongest form of the contract and
+// the one a caller can actually rely on.
+func TestASessionsOutputSurvivesTheReap(t *testing.T) {
+	l := &Local{}
+	sess, err := l.NewSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	stdout, err := sess.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.Start("echo surviving"); err != nil {
+		t.Fatal(err)
+	}
+	rc, err := sess.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if rc != 0 {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+
+	// Nothing has read a byte yet, and the process is already reaped.
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, stdout); err != nil {
+		t.Fatalf("reading after Wait: %v", err)
+	}
+	if got := strings.TrimSpace(buf.String()); got != "surviving" {
+		t.Errorf("stdout after Wait = %q, want %q -- the reap ate the output", got, "surviving")
+	}
+}
