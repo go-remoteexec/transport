@@ -25,6 +25,22 @@ type Local struct {
 	// TempDir is where TempPath builds paths under. Defaults to
 	// os.TempDir().
 	TempDir string
+
+	// Dir is the working directory commands run in, and the directory
+	// a RELATIVE remote path resolves against. Empty (the default)
+	// means the process's own working directory, which is what this
+	// connection did before Dir existed.
+	//
+	// It exists because "the target" for a local connection is this
+	// machine, and a caller generally means paths relative to
+	// something of its own rather than to wherever its process happens
+	// to have been started. Ansible is the case in point: it runs a
+	// local module with the working directory set to the PLAYBOOK's
+	// directory, so `path: files/data.csv` in a playbook resolves
+	// beside that playbook however the command was invoked -- measured
+	// against ansible-core 2.21.4, from three different working
+	// directories, inside a role and out.
+	Dir string
 }
 
 // NewLocal returns a Local connection using "sh" resolved via PATH.
@@ -52,6 +68,7 @@ func (l *Local) shell() string {
 
 func (l *Local) Exec(ctx context.Context, cmd string, stdin io.Reader) (Result, error) {
 	c := exec.CommandContext(ctx, l.shell(), "-c", cmd)
+	c.Dir = l.Dir
 	c.Stdin = stdin
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
@@ -99,6 +116,7 @@ func asExitError(err error, target **exec.ExitError) bool {
 // bridging goroutine for Wait to wait on.
 func (l *Local) NewSession(ctx context.Context) (Session, error) {
 	cmd := exec.CommandContext(ctx, l.shell(), "-c", "")
+	cmd.Dir = l.Dir
 	// A shell command like "sleep 30" runs as a grandchild that inherits
 	// the shell's stdout/stderr fds; killing only the shell (Close does
 	// exactly that, via Process.Kill) leaves the grandchild holding those
@@ -213,6 +231,10 @@ func (s *localSession) Close() error {
 }
 
 func (l *Local) Put(ctx context.Context, localPath, remotePath string, opts PutOptions) error {
+	// The REMOTE path resolves against Dir; the local one is the
+	// caller's own and is left alone, exactly as it would be for a
+	// non-local connection.
+	remotePath = l.resolve(remotePath)
 	if opts.MkdirParents {
 		if err := os.MkdirAll(filepath.Dir(remotePath), 0o755); err != nil {
 			return fmt.Errorf("transport: %w", err)
@@ -230,11 +252,11 @@ func (l *Local) Put(ctx context.Context, localPath, remotePath string, opts PutO
 }
 
 func (l *Local) Fetch(ctx context.Context, remotePath, localPath string) error {
-	return copyFile(remotePath, localPath)
+	return copyFile(l.resolve(remotePath), localPath)
 }
 
 func (l *Local) Remove(ctx context.Context, remotePath string) error {
-	if err := os.Remove(remotePath); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(l.resolve(remotePath)); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("transport: %w", err)
 	}
 	return nil
@@ -252,6 +274,15 @@ func (l *Local) TempPath(base string) string {
 	}
 	n := atomic.AddUint64(&tempPathCounter, 1)
 	return filepath.Join(dir, fmt.Sprintf("remoteexec_%d_%d_%s", time.Now().UnixNano(), n, base))
+}
+
+// resolve turns a relative remote path into one under Dir. An absolute
+// path, and any path at all when Dir is unset, is returned untouched.
+func (l *Local) resolve(path string) string {
+	if l.Dir == "" || path == "" || filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(l.Dir, path)
 }
 
 func (l *Local) Close() error { return nil }
