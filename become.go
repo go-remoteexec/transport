@@ -23,6 +23,92 @@ type BecomeConfig struct {
 	Method   BecomeMethod // default BecomeSudo
 	User     string       // default "root"
 	Password string       // optional; empty assumes passwordless (NOPASSWD sudoers, or doas persist)
+
+	// Exe overrides the program the method runs, Ansible's become_exe
+	// (ansible_become_exe / ANSIBLE_BECOME_EXE). Empty means the
+	// method's own name, which is what Ansible does: `become_exe` in
+	// the real sudo plugin reads `self.get_option('become_exe') or
+	// self.name`. A full path is the usual reason to set it.
+	Exe string
+
+	// Flags replaces the method's default flags, Ansible's become_flags
+	// (ansible_become_flags / ANSIBLE_BECOME_FLAGS). Empty means the
+	// method's own default -- "-H -S -n" for sudo, "" for su and doas,
+	// read from each real become plugin's DOCUMENTATION. Set it and it
+	// replaces that default outright rather than adding to it, which is
+	// also what Ansible does.
+	//
+	// With a password set, sudo's own plugin strips -n/--non-interactive
+	// out of the flags before use, since a non-interactive sudo can
+	// never read the password it was just given. The same stripping
+	// happens here, including the -n folded into a short cluster like
+	// -Hn, so a caller that sets Flags and a Password does not have to
+	// know to remove it.
+	Flags string
+}
+
+// defaultBecomeFlags are each method's own default flag string, taken
+// from the real become plugins' DOCUMENTATION blocks. A method absent
+// from this map defaults to no flags.
+var defaultBecomeFlags = map[BecomeMethod]string{
+	BecomeSudo: "-H -S -n",
+}
+
+// flags returns the flag string to use: Flags when set, otherwise the
+// method's default, with -n removed when a password has to be read.
+func (c BecomeConfig) flags() string {
+	f := c.Flags
+	if f == "" {
+		f = defaultBecomeFlags[c.Method]
+	}
+	if c.Password == "" || f == "" {
+		return f
+	}
+	return stripNonInteractive(f)
+}
+
+// stripNonInteractive removes -n/--non-interactive from a flag string,
+// including an n folded into a short cluster (-Hn -> -H), mirroring the
+// regex real sudo.py applies for the same reason: the password has to
+// be readable.
+func stripNonInteractive(flags string) string {
+	var out []string
+	for _, f := range strings.Fields(flags) {
+		switch {
+		case f == "-n" || f == "--non-interactive":
+			continue
+		case strings.HasPrefix(f, "--"):
+			out = append(out, f)
+		case strings.HasPrefix(f, "-") && strings.Contains(f, "n"):
+			if s := "-" + strings.Replace(f[1:], "n", "", 1); s != "-" {
+				out = append(out, s)
+			}
+		default:
+			out = append(out, f)
+		}
+	}
+	return strings.Join(out, " ")
+}
+
+// exe returns the program to run: Exe when set, otherwise the method's
+// own name.
+func (c BecomeConfig) exe() string {
+	if c.Exe != "" {
+		return c.Exe
+	}
+	return string(c.Method)
+}
+
+// joinBecome assembles a become command line, dropping the empty parts
+// so an unset flag string does not leave a double space.
+func joinBecome(parts ...string) string {
+	var out []string
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return strings.Join(out, " ")
 }
 
 // Become wraps conn so every Exec runs as BecomeConfig.User via the
@@ -121,34 +207,34 @@ func (b *becomeConnection) Exec(ctx context.Context, cmd string, stdin io.Reader
 // else — the become password, newline-terminated.
 func (c BecomeConfig) wrapCommand(inner string) (cmdLine string, stdin string) {
 	sh := fmt.Sprintf("sh -c %s", shellQuote(inner))
+	exe, flags := c.exe(), c.flags()
 
 	switch c.Method {
 	case BecomeSu:
 		// su reads the password from its controlling terminal or stdin
 		// when not run interactively; -c hands the rest to the shell.
-		cmd := fmt.Sprintf("su %s -c %s", shellQuote(c.User), shellQuote(sh))
+		cmd := joinBecome(exe, flags, shellQuote(c.User), "-c", shellQuote(sh))
 		if c.Password != "" {
 			return cmd, c.Password + "\n"
 		}
 		return cmd, ""
 
 	case BecomeDoas:
-		cmd := fmt.Sprintf("doas -u %s %s", shellQuote(c.User), sh)
+		cmd := joinBecome(exe, flags, "-u", shellQuote(c.User), sh)
 		if c.Password != "" {
 			return cmd, c.Password + "\n"
 		}
 		return cmd, ""
 
 	default: // BecomeSudo
+		// The default flags are sudo's own "-H -S -n". -S reads the
+		// password from stdin rather than the tty, and -n fails instead
+		// of prompting -- which is why flags() drops -n as soon as a
+		// password is configured, exactly as the real plugin does.
+		cmd := joinBecome(exe, flags, "-u", shellQuote(c.User), sh)
 		if c.Password != "" {
-			// -S: read the password from stdin instead of the tty.
-			cmd := fmt.Sprintf("sudo -H -S -u %s %s", shellQuote(c.User), sh)
 			return cmd, c.Password + "\n"
 		}
-		// -n: fail instead of prompting — the right default when no
-		// password was configured, matching passwordless-sudo setups
-		// used by most real automation.
-		cmd := fmt.Sprintf("sudo -H -n -u %s %s", shellQuote(c.User), sh)
 		return cmd, ""
 	}
 }
