@@ -36,9 +36,24 @@ type WinRMConfig struct {
 
 	Password string
 
-	SSL       bool   // default true
-	SSLVerify bool   // default true
-	CACert    string // path to a CA certificate PEM (custom trust root)
+	SSL    bool   // whether to reach the endpoint over TLS
+	CACert string // path to a CA certificate PEM (custom trust root)
+
+	// InsecureSkipVerify disables TLS certificate verification. It is
+	// named for what it does, and phrased so the dangerous state is the
+	// one a caller has to type -- the same reason crypto/tls spells its
+	// own field this way.
+	//
+	// It replaces an SSLVerify field whose comment said "default true"
+	// while the code read `if !c.SSLVerify { InsecureSkipVerify = true }`.
+	// A bool's zero value is false, so every config that did not mention
+	// verification got none, and the credentials this connection sends as
+	// HTTP Basic went to an unverified endpoint. The rename is deliberate
+	// rather than a flip of the old field's meaning: inverting SSLVerify
+	// in place would have changed both known callers' behaviour with no
+	// compile error to notice it by, and one of them was relying on the
+	// accidental default. A build failure at each call site is the point.
+	InsecureSkipVerify bool
 
 	// Transport selects the auth scheme: "negotiate" (default), "basic",
 	// or "ssl" (TLS client certificate — set ClientCert/ClientKey).
@@ -120,9 +135,7 @@ func buildWinRMClient(c WinRMConfig) (HTTPDoer, error) {
 	tr := &http.Transport{}
 	if c.SSL {
 		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
-		if !c.SSLVerify {
-			tlsCfg.InsecureSkipVerify = true
-		}
+		tlsCfg.InsecureSkipVerify = c.InsecureSkipVerify
 		if c.CACert != "" {
 			pemBytes, err := os.ReadFile(c.CACert)
 			if err != nil {
