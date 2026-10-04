@@ -251,12 +251,18 @@ func (s *localSession) doWait() (int, error) {
 	return s.waitRC, s.waitErr
 }
 
-// Close terminates the process (if still running) and reaps it. Safe to
-// call after Wait, and safe to call more than once. It does not need to
-// close the session's pipes itself: since StdinPipe/StdoutPipe/StderrPipe
-// are real os/exec pipes rather than a manually bridged io.Pipe, Cmd.Wait
-// (via doWait, above) already closes them on the way out — that is
-// exactly the deadlock NewSession's doc comment describes avoiding.
+// Close terminates the process (if still running), reaps it, and closes
+// the output pipes' read ends. Safe to call after Wait, and safe to call
+// more than once.
+//
+// This comment used to say the opposite -- that Close "does not need to
+// close the session's pipes itself" because Cmd.Wait closes them on the
+// way out. That stopped being true when stdout and stderr became our own
+// os.Pipe so a session's output could survive the reap, and the stale
+// promise was load-bearing for callers: configuration-management-tool
+// drained its copier goroutines BEFORE calling Close, which is the order
+// the old comment invites and which deadlocks whenever a grandchild of
+// the command still holds the write end.
 func (s *localSession) Close() error {
 	if s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
