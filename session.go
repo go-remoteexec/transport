@@ -35,8 +35,20 @@ type Session interface {
 	// wait on the command at all.
 	Wait() (int, error)
 	// Close releases the session's resources, terminating the remote
-	// process if Wait has not yet returned. Safe to call after Wait, and
-	// safe to call more than once.
+	// process if Wait has not yet returned, and closing the readers
+	// StdoutPipe/StderrPipe returned. Safe to call after Wait, and safe
+	// to call more than once.
+	//
+	// ORDER MATTERS when a caller drains those readers from their own
+	// goroutines. A session's output survives the reap on purpose, so
+	// the read ends stay open until Close and nothing else closes them:
+	//
+	//   - command exited on its own: drain first, then Close. Everything
+	//     it wrote is readable, and the readers reach EOF by themselves.
+	//   - you are force-closing it: Close FIRST, then join the drainers.
+	//     EOF only arrives once every holder of the write end is gone,
+	//     and a grandchild the command forked is not covered by killing
+	//     the command. Waiting for that EOF never returns.
 	Close() error
 }
 
