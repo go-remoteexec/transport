@@ -1,6 +1,6 @@
 module github.com/go-remoteexec/transport
 
-go 1.26.4
+go 1.27.1
 
 require (
 	github.com/Azure/go-ntlmssp v0.1.1
