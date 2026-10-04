@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -21,15 +22,19 @@ import (
 // the prefix IS visible, and ExecEnv is not. It is written as one test
 // so the comparison cannot drift apart.
 func TestExecEnvKeepsACredentialOutOfPs(t *testing.T) {
-	// `ps` is the instrument here, and Windows has none. Skipping is
-	// honest ONLY because the skip is this narrow: the property is
-	// unverified on a platform without a process-listing tool this test
-	// can read, and the test says so rather than passing silently.
+	// This asserts a POSIX property: that `sh -c "VAR=x cmd; more"`
+	// leaves the assignment in a live shell's argv. `VAR=x cmd` is not
+	// a thing under cmd.exe, so there is nothing to assert on Windows --
+	// the skip is about the PREMISE, not a missing tool.
 	//
-	// A skip reads as a pass, which is why the condition is the
-	// instrument's absence and nothing else -- never a failure mode.
-	if _, err := exec.LookPath("ps"); err != nil {
-		t.Skip("no ps on this platform: the argv-visibility property cannot be observed here")
+	// Gating on exec.LookPath("ps") was tried first and was wrong:
+	// GitHub's windows-latest carries a Git-for-Windows `ps` that
+	// resolves fine and lists nothing this test can read, so the
+	// instrument check passed and the control then failed. A skip reads
+	// as a pass, so the condition has to be the one that is actually
+	// true rather than the one that makes CI green.
+	if runtime.GOOS == "windows" {
+		t.Skip("the premise is a POSIX shell's argv; VAR=x cmd has no meaning here")
 	}
 
 	// ⚠ The canary is GENERATED HERE, never written as a literal in any
