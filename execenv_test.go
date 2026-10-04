@@ -21,6 +21,17 @@ import (
 // the prefix IS visible, and ExecEnv is not. It is written as one test
 // so the comparison cannot drift apart.
 func TestExecEnvKeepsACredentialOutOfPs(t *testing.T) {
+	// `ps` is the instrument here, and Windows has none. Skipping is
+	// honest ONLY because the skip is this narrow: the property is
+	// unverified on a platform without a process-listing tool this test
+	// can read, and the test says so rather than passing silently.
+	//
+	// A skip reads as a pass, which is why the condition is the
+	// instrument's absence and nothing else -- never a failure mode.
+	if _, err := exec.LookPath("ps"); err != nil {
+		t.Skip("no ps on this platform: the argv-visibility property cannot be observed here")
+	}
+
 	// ⚠ The canary is GENERATED HERE, never written as a literal in any
 	// shell command. A first version used a fixed string and `ps` found
 	// it -- in the shell that had created the test file, whose own
