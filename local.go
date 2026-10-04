@@ -67,9 +67,22 @@ func (l *Local) shell() string {
 }
 
 func (l *Local) Exec(ctx context.Context, cmd string, stdin io.Reader) (Result, error) {
+	return l.exec(ctx, cmd, nil, stdin)
+}
+
+// exec is the shared body. env, when non-empty, is set on the child
+// process -- appended to the inherited environment, as os/exec does
+// when Env is set from os.Environ().
+func (l *Local) exec(ctx context.Context, cmd string, env map[string]string, stdin io.Reader) (Result, error) {
 	c := exec.CommandContext(ctx, l.shell(), "-c", cmd)
 	c.Dir = l.Dir
 	c.Stdin = stdin
+	if len(env) > 0 {
+		c.Env = os.Environ()
+		for k, v := range env {
+			c.Env = append(c.Env, k+"="+v)
+		}
+	}
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
 	c.Stderr = &stderr
@@ -280,6 +293,13 @@ func (s *localSession) Close() error {
 		_ = c.Close()
 	}
 	return nil
+}
+
+// ExecEnv is Exec with env set on the child PROCESS rather than on the
+// command line, so a credential never reaches the shell's argv. See
+// EnvExecer for why that distinction matters.
+func (l *Local) ExecEnv(ctx context.Context, cmd string, env map[string]string, stdin io.Reader) (Result, error) {
+	return l.exec(ctx, cmd, env, stdin)
 }
 
 func (l *Local) Put(ctx context.Context, localPath, remotePath string, opts PutOptions) error {
