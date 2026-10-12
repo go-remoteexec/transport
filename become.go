@@ -1,11 +1,14 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"os"
+	"path"
 	"strings"
 )
 
@@ -112,10 +115,25 @@ func joinBecome(parts ...string) string {
 }
 
 // Become wraps conn so every Exec runs as BecomeConfig.User via the
-// configured escalation method. Put/Fetch/Close pass through unchanged
-// (Ansible's own become plumbing only affects command execution, not
-// file transfer, since the transferred file is written by the
-// connection's own user and then chmod/chowned by an escalated task).
+// configured escalation method, and so do Put, Fetch and Remove: they
+// are carried out through that same escalated Exec.
+//
+// They used to pass through unchanged, on the reasoning that Ansible's
+// become only affects command execution: the controller writes the file
+// into a temporary directory as the connection's own user, and an
+// escalated module moves it into place. That reasoning holds for Ansible
+// and not for the callers of this package. go-ansible's copy, template,
+// lineinfile and blockinfile Put straight to the destination, so with
+// `become: true` on a stock Ubuntu cloud image every one of them failed
+// on a root-owned file:
+//
+//	writing /etc/hosts: transport: put /etc/hosts: exit 1:
+//	bash: line 1: /etc/hosts: Permission denied
+//
+// -- the task asked for root and the write was made as `ubuntu`. Doing
+// the transfer through the wrapper's own Exec makes the file land with
+// the privileges the task asked for, whichever module wrote it. Close
+// still passes through.
 //
 // Known gap: the wrapper returned here does not implement Streamer, even
 // when conn does. Exec's become handling works by printing a random
@@ -145,6 +163,61 @@ func Become(conn Connection, cfg BecomeConfig) Connection {
 type becomeConnection struct {
 	Connection
 	cfg BecomeConfig
+}
+
+// Put writes localPath to remotePath as the become user, the same way
+// SSH.Put does it as the login user: through `cat >` on the remote
+// shell, with the file's bytes on stdin -- after the become password,
+// when there is one, which Exec puts first.
+func (b *becomeConnection) Put(ctx context.Context, localPath, remotePath string, opts PutOptions) error {
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return fmt.Errorf("transport: %w", err)
+	}
+	if opts.MkdirParents {
+		if dir := path.Dir(remotePath); dir != "." && dir != "/" {
+			if err := b.run(ctx, "preparing "+dir, "mkdir -p "+shellQuote(dir), nil); err != nil {
+				return err
+			}
+		}
+	}
+	if err := b.run(ctx, "put "+remotePath, "cat > "+shellQuote(remotePath), bytes.NewReader(data)); err != nil {
+		return err
+	}
+	if opts.Executable {
+		return b.run(ctx, "chmod +x "+remotePath, "chmod +x "+shellQuote(remotePath), nil)
+	}
+	return nil
+}
+
+// Fetch reads remotePath as the become user, so a root-only file
+// (/etc/shadow, a munge key) can be fetched or slurped.
+func (b *becomeConnection) Fetch(ctx context.Context, remotePath, localPath string) error {
+	res, err := b.Exec(ctx, "cat "+shellQuote(remotePath), nil)
+	if err != nil {
+		return fmt.Errorf("transport: fetch %s: %w", remotePath, err)
+	}
+	if res.RC != 0 {
+		return fmt.Errorf("transport: fetch %s: exit %d: %s", remotePath, res.RC, res.Stderr)
+	}
+	return os.WriteFile(localPath, []byte(res.Stdout), 0o644)
+}
+
+// Remove deletes remotePath as the become user.
+func (b *becomeConnection) Remove(ctx context.Context, remotePath string) error {
+	return b.run(ctx, "remove "+remotePath, "rm -f "+shellQuote(remotePath), nil)
+}
+
+// run is Exec for a command whose only useful outcome is success.
+func (b *becomeConnection) run(ctx context.Context, what, cmd string, stdin io.Reader) error {
+	res, err := b.Exec(ctx, cmd, stdin)
+	if err != nil {
+		return fmt.Errorf("transport: %s: %w", what, err)
+	}
+	if res.RC != 0 {
+		return fmt.Errorf("transport: %s: exit %d: %s", what, res.RC, res.Stderr)
+	}
+	return nil
 }
 
 // successMarker is a fresh random token printed right before the real
