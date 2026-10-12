@@ -86,68 +86,74 @@ func serveTestSSHConn(t *testing.T, nc net.Conn, config *ssh.ServerConfig) {
 		if err != nil {
 			return
 		}
-		go func() {
-			defer channel.Close()
-			for req := range requests {
-				if req.Type != "exec" {
-					if req.WantReply {
-						req.Reply(false, nil)
-					}
-					continue
-				}
-				var payload struct{ Command string }
-				ssh.Unmarshal(req.Payload, &payload)
-				if req.WantReply {
-					req.Reply(true, nil)
-				}
+		go serveTestSession(channel, requests)
+	}
+}
 
-				// Wire the child directly to the channel via pipes (not a
-				// buffer filled in after Run completes) so output really
-				// streams to the client as it is produced — exercising
-				// SSH's streaming Session honestly, not just its buffered
-				// Exec.
-				// Bare "sh", not "/bin/sh": this fake server is itself a
-				// local child process during the test, and Windows'
-				// os/exec LookPath doesn't treat "/" as a path separator
-				// — see the same reasoning in local.go's NewLocal.
-				cmd := exec.Command("sh", "-c", payload.Command)
-				stdinPipe, _ := cmd.StdinPipe()
-				stdoutPipe, _ := cmd.StdoutPipe()
-				stderrPipe, _ := cmd.StderrPipe()
-				if err := cmd.Start(); err != nil {
-					channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{127}))
-					return
-				}
-
-				go func() {
-					io.Copy(stdinPipe, channel)
-					stdinPipe.Close()
-				}()
-				var copyWG sync.WaitGroup
-				copyWG.Add(2)
-				go func() { defer copyWG.Done(); io.Copy(channel, stdoutPipe) }()
-				go func() { defer copyWG.Done(); io.Copy(channel.Stderr(), stderrPipe) }()
-
-				// cmd.Wait must not run concurrently with the stdout/
-				// stderr copies above: per the os/exec docs for
-				// StdoutPipe/StderrPipe, Wait closes the underlying pipe
-				// once the process exits, and calling it before all reads
-				// have finished can truncate output that just hasn't been
-				// drained yet — fast locally, but a real, reproducible
-				// race under slow qemu emulation. Drain first, reap after.
-				copyWG.Wait()
-				runErr := cmd.Wait()
-
-				exitCode := 0
-				if runErr != nil {
-					if ee, ok := runErr.(*exec.ExitError); ok {
-						exitCode = ee.ExitCode()
-					}
-				}
-				channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(exitCode)}))
-				return
+// serveTestSession runs one accepted "session" channel: the first
+// "exec" request's command is run through sh, wired straight to the
+// channel. Shared with the jump-host server in ssh_jump_test.go, whose
+// target and hops must execute commands exactly as this one does.
+func serveTestSession(channel ssh.Channel, requests <-chan *ssh.Request) {
+	defer channel.Close()
+	for req := range requests {
+		if req.Type != "exec" {
+			if req.WantReply {
+				req.Reply(false, nil)
 			}
+			continue
+		}
+		var payload struct{ Command string }
+		ssh.Unmarshal(req.Payload, &payload)
+		if req.WantReply {
+			req.Reply(true, nil)
+		}
+
+		// Wire the child directly to the channel via pipes (not a
+		// buffer filled in after Run completes) so output really
+		// streams to the client as it is produced — exercising
+		// SSH's streaming Session honestly, not just its buffered
+		// Exec.
+		// Bare "sh", not "/bin/sh": this fake server is itself a
+		// local child process during the test, and Windows'
+		// os/exec LookPath doesn't treat "/" as a path separator
+		// — see the same reasoning in local.go's NewLocal.
+		cmd := exec.Command("sh", "-c", payload.Command)
+		stdinPipe, _ := cmd.StdinPipe()
+		stdoutPipe, _ := cmd.StdoutPipe()
+		stderrPipe, _ := cmd.StderrPipe()
+		if err := cmd.Start(); err != nil {
+			channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{127}))
+			return
+		}
+
+		go func() {
+			io.Copy(stdinPipe, channel)
+			stdinPipe.Close()
 		}()
+		var copyWG sync.WaitGroup
+		copyWG.Add(2)
+		go func() { defer copyWG.Done(); io.Copy(channel, stdoutPipe) }()
+		go func() { defer copyWG.Done(); io.Copy(channel.Stderr(), stderrPipe) }()
+
+		// cmd.Wait must not run concurrently with the stdout/
+		// stderr copies above: per the os/exec docs for
+		// StdoutPipe/StderrPipe, Wait closes the underlying pipe
+		// once the process exits, and calling it before all reads
+		// have finished can truncate output that just hasn't been
+		// drained yet — fast locally, but a real, reproducible
+		// race under slow qemu emulation. Drain first, reap after.
+		copyWG.Wait()
+		runErr := cmd.Wait()
+
+		exitCode := 0
+		if runErr != nil {
+			if ee, ok := runErr.(*exec.ExitError); ok {
+				exitCode = ee.ExitCode()
+			}
+		}
+		channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(exitCode)}))
+		return
 	}
 }
 
