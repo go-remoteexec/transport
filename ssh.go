@@ -42,6 +42,18 @@ type SSHConfig struct {
 	// server that refuses it does not fail the command).
 	TTY bool
 
+	// ProxyJump reaches the target THROUGH one or more bastions, in
+	// OpenSSH's own -J syntax: [user@]host[:port], comma separated for
+	// a chain, dialled left to right. "none" disables it, as it does
+	// in ssh_config.
+	//
+	// Each hop inherits this config's credentials and host-key policy,
+	// overriding only what its own spec names. OpenSSH reads each hop's
+	// settings from ssh_config instead; there is none here, and
+	// inheriting is what lets `-o ProxyJump=bastion` work with the key
+	// the run already has.
+	ProxyJump string
+
 	Timeout time.Duration // default 30s
 
 	// Dialer establishes the transport-level TCP connection. Defaults
@@ -56,6 +68,11 @@ type SSH struct {
 	client  *ssh.Client
 	tempDir string
 	tty     bool
+
+	// jumps are the ProxyJump bastions this connection was reached
+	// through, outermost first. They are held because closing the
+	// target's client does not close the tunnels underneath it.
+	jumps []*SSH
 }
 
 // DialSSH connects and authenticates to cfg.Host, trying (in order)
@@ -115,21 +132,42 @@ func DialSSH(ctx context.Context, cfg SSHConfig) (*SSH, error) {
 	}
 
 	addr := net.JoinHostPort(cfg.Host, fmt.Sprintf("%d", cfg.Port))
+
+	hops, err := parseProxyJump(cfg.ProxyJump)
+	if err != nil {
+		return nil, fmt.Errorf("transport: %w", err)
+	}
 	dial := cfg.Dialer
+	var jumps []*SSH
+	if len(hops) > 0 {
+		// The last hop's client becomes the dialer for the target, so
+		// the target's own handshake happens inside the tunnel.
+		dial, jumps, err = dialThroughJumps(ctx, cfg, hops)
+		if err != nil {
+			return nil, fmt.Errorf("transport: ProxyJump: %w", err)
+		}
+	}
 	if dial == nil {
 		d := net.Dialer{Timeout: cfg.Timeout}
 		dial = d.DialContext
 	}
+	closeJumps := func() {
+		for i := len(jumps) - 1; i >= 0; i-- {
+			jumps[i].Close()
+		}
+	}
 	conn, err := dial(ctx, "tcp", addr)
 	if err != nil {
+		closeJumps()
 		return nil, fmt.Errorf("transport: dialing %s: %w", addr, err)
 	}
 	sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, clientCfg)
 	if err != nil {
 		conn.Close()
+		closeJumps()
 		return nil, fmt.Errorf("transport: ssh handshake with %s: %w", addr, err)
 	}
-	return &SSH{client: ssh.NewClient(sshConn, chans, reqs), tempDir: cfg.TempDir, tty: cfg.TTY}, nil
+	return &SSH{client: ssh.NewClient(sshConn, chans, reqs), tempDir: cfg.TempDir, tty: cfg.TTY, jumps: jumps}, nil
 }
 
 func sshHostKeyCallback(cfg SSHConfig) (ssh.HostKeyCallback, error) {
@@ -350,5 +388,13 @@ func (s *SSH) TempPath(base string) string {
 }
 
 func (s *SSH) Close() error {
-	return s.client.Close()
+	err := s.client.Close()
+	// Innermost first: the target's tunnel before the bastion carrying
+	// it. A hop's error does not mask the target's.
+	for i := len(s.jumps) - 1; i >= 0; i-- {
+		if jerr := s.jumps[i].Close(); jerr != nil && err == nil {
+			err = jerr
+		}
+	}
+	return err
 }
