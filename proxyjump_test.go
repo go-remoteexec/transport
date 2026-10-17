@@ -16,56 +16,6 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-func TestParseProxyJump(t *testing.T) {
-	for _, c := range []struct {
-		spec string
-		want []jumpHop
-		bad  bool
-	}{
-		{spec: "", want: nil},
-		// OpenSSH's own way of cancelling a ProxyJump set earlier in a
-		// config file. It is not a host called "none".
-		{spec: "none", want: nil},
-		{spec: "bastion", want: []jumpHop{{host: "bastion"}}},
-		{spec: "bastion:2222", want: []jumpHop{{host: "bastion", port: 2222}}},
-		{spec: "jump@bastion", want: []jumpHop{{user: "jump", host: "bastion"}}},
-		{spec: "jump@bastion:2222", want: []jumpHop{{user: "jump", host: "bastion", port: 2222}}},
-		{spec: "a,b:2,c@d", want: []jumpHop{{host: "a"}, {host: "b", port: 2}, {user: "c", host: "d"}}},
-		{spec: " a , b ", want: []jumpHop{{host: "a"}, {host: "b"}}},
-		// A colon inside a host can only be an IPv6 literal, and only
-		// brackets can say so -- as OpenSSH also requires.
-		{spec: "[::1]", want: []jumpHop{{host: "::1"}}},
-		{spec: "[::1]:2222", want: []jumpHop{{host: "::1", port: 2222}}},
-		{spec: "u@[fe80::1]:22", want: []jumpHop{{user: "u", host: "fe80::1", port: 22}}},
-		{spec: "::1", bad: true},
-		{spec: "a,,b", bad: true},
-		{spec: "@host", bad: true},
-		{spec: "host:notaport", bad: true},
-		{spec: "[::1", bad: true},
-	} {
-		t.Run(c.spec, func(t *testing.T) {
-			got, err := parseProxyJump(c.spec)
-			if c.bad {
-				if err == nil {
-					t.Fatalf("parsed %q as %+v, want an error", c.spec, got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("parseProxyJump(%q): %v", c.spec, err)
-			}
-			if len(got) != len(c.want) {
-				t.Fatalf("got %+v, want %+v", got, c.want)
-			}
-			for i := range got {
-				if got[i] != c.want[i] {
-					t.Errorf("hop %d = %+v, want %+v", i, got[i], c.want[i])
-				}
-			}
-		})
-	}
-}
-
 // startTestBastion runs an in-process SSH server that forwards
 // direct-tcpip channels -- what a jump host does, and what
 // ssh.Client.DialContext asks for. It counts the forwards so a test can
@@ -186,7 +136,7 @@ func TestProxyJumpReachesTheTargetThroughTheBastion(t *testing.T) {
 		User:         "tuser",
 		Password:     "tpass",
 		HostKeyCheck: false,
-		ProxyJump:    bastionAddr,
+		ProxyJump:    []SSHConfig{jumpTo(t, bastionAddr)},
 	})
 	if err != nil {
 		t.Fatalf("DialSSH through %s: %v", bastionAddr, err)
@@ -243,7 +193,7 @@ func TestProxyJumpWalksAChainOfTwo(t *testing.T) {
 		User:         "tuser",
 		Password:     "tpass",
 		HostKeyCheck: false,
-		ProxyJump:    firstAddr + "," + secondAddr,
+		ProxyJump:    []SSHConfig{jumpTo(t, firstAddr), jumpTo(t, secondAddr)},
 	})
 	if err != nil {
 		t.Fatalf("DialSSH through %s,%s: %v", firstAddr, secondAddr, err)
@@ -277,7 +227,7 @@ func TestProxyJumpReportsAnUnreachableBastion(t *testing.T) {
 		User:         "tuser",
 		Password:     "tpass",
 		HostKeyCheck: false,
-		ProxyJump:    "127.0.0.1:1", // nothing listens on port 1
+		ProxyJump:    []SSHConfig{{Host: "127.0.0.1", Port: 1}}, // nothing listens on port 1
 	})
 	if err == nil {
 		t.Fatal("dialling through an unreachable bastion succeeded")
@@ -285,4 +235,74 @@ func TestProxyJumpReportsAnUnreachableBastion(t *testing.T) {
 	if !strings.Contains(err.Error(), "ProxyJump") || !strings.Contains(err.Error(), "127.0.0.1:1") {
 		t.Errorf("error %q names neither ProxyJump nor the hop", err)
 	}
+}
+
+// jumpTo is a hop naming nothing but where it is: everything else --
+// user, credentials, host-key policy -- is inherited from the target,
+// which is the contract go-ansible/playbook relies on when it parses a
+// bare `-o ProxyJump=bastion`.
+func jumpTo(t *testing.T, addr string) SSHConfig {
+	t.Helper()
+	host, port := hostPort(t, addr)
+	return SSHConfig{Host: host, Port: port}
+}
+
+// The inheritance itself, asserted rather than only exercised: a hop
+// that names no credential must end up with the target's, and one that
+// names its own must keep it.
+func TestAHopInheritsWhatItDoesNotName(t *testing.T) {
+	target := SSHConfig{
+		User: "tuser", Password: "tpass",
+		PrivateKeyFile: "/key", PrivateKeyPassphrase: "phrase",
+		UseAgent: true, HostKeyCheck: true, KnownHostsFile: "/kh",
+		Timeout: 7, TempDir: "/target-tmp", TTY: true,
+		ProxyJump: []SSHConfig{{Host: "somewhere"}},
+	}
+
+	t.Run("a bare hop takes the target's credentials", func(t *testing.T) {
+		got := inheritJumpCredentials(SSHConfig{Host: "bastion"}, target)
+		for _, c := range []struct{ name, got, want string }{
+			{"User", got.User, "tuser"},
+			{"Password", got.Password, "tpass"},
+			{"PrivateKeyFile", got.PrivateKeyFile, "/key"},
+			{"KnownHostsFile", got.KnownHostsFile, "/kh"},
+		} {
+			if c.got != c.want {
+				t.Errorf("%s = %q, want %q", c.name, c.got, c.want)
+			}
+		}
+		if got.Port != 22 {
+			t.Errorf("Port = %d, want 22", got.Port)
+		}
+		if !got.HostKeyCheck {
+			t.Error("HostKeyCheck was downgraded for the hop")
+		}
+		if got.Timeout != 7 {
+			t.Errorf("Timeout = %v, want the target's 7", got.Timeout)
+		}
+	})
+
+	t.Run("a hop's own key is kept, and the target's is not added", func(t *testing.T) {
+		got := inheritJumpCredentials(SSHConfig{Host: "b", User: "jump", PrivateKeyFile: "/own"}, target)
+		if got.User != "jump" {
+			t.Errorf("User = %q, want the hop's own", got.User)
+		}
+		if got.PrivateKeyFile != "/own" {
+			t.Errorf("PrivateKeyFile = %q, want /own", got.PrivateKeyFile)
+		}
+		if got.Password != "" || got.UseAgent {
+			t.Errorf("the target's credentials leaked onto a hop that named its own: password=%q useAgent=%v",
+				got.Password, got.UseAgent)
+		}
+	})
+
+	t.Run("a hop is a tunnel, not a place commands run", func(t *testing.T) {
+		got := inheritJumpCredentials(SSHConfig{Host: "b"}, target)
+		if got.ProxyJump != nil {
+			t.Error("a hop inherited the target's ProxyJump, which would recurse")
+		}
+		if got.TempDir != "" || got.TTY {
+			t.Errorf("a hop inherited TempDir=%q TTY=%v", got.TempDir, got.TTY)
+		}
+	})
 }
