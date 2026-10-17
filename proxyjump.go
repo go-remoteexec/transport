@@ -5,105 +5,57 @@ import (
 	"fmt"
 	"net"
 	"strconv"
-	"strings"
 )
 
-// jumpHop is one bastion in a ProxyJump chain.
-type jumpHop struct {
-	user string // empty: inherit the target's User
-	host string
-	port int // 0: 22
-}
-
-// parseProxyJump parses an OpenSSH ProxyJump / -J specification: one or
-// more hops, comma separated, each [user@]host[:port], dialled left to
-// right with the last one reaching the target.
+// inheritJumpCredentials fills in what a hop left unset from the target's
+// own config. A caller that parsed `-o ProxyJump=bastion` knows the
+// bastion's host, and its user and port when the spec named them; it
+// does not know which key or password to use, and in OpenSSH that comes
+// from ssh_config. There is no ssh_config here, so the target's
+// credentials and host-key policy are the sensible stand-in -- and they
+// are what makes a bare `-o ProxyJump=bastion` work at all.
 //
-// The literal "none" disables jumping, which is OpenSSH's own way of
-// cancelling a ProxyJump set earlier in a config file; it returns no
-// hops rather than looking for a host called "none".
-//
-// IPv6 literals are accepted in brackets, [::1]:2222, because that is
-// the only way a colon can appear in a host without being the port
-// separator.
-func parseProxyJump(spec string) ([]jumpHop, error) {
-	spec = strings.TrimSpace(spec)
-	if spec == "" || spec == "none" {
-		return nil, nil
+// A hop that DOES name something keeps it, so a bastion reached with its
+// own key stays possible.
+func inheritJumpCredentials(hop, target SSHConfig) SSHConfig {
+	if hop.User == "" {
+		hop.User = target.User
 	}
-
-	var hops []jumpHop
-	for _, raw := range strings.Split(spec, ",") {
-		part := strings.TrimSpace(raw)
-		if part == "" {
-			return nil, fmt.Errorf("empty hop in ProxyJump %q", spec)
-		}
-		var hop jumpHop
-		if at := strings.LastIndex(part, "@"); at >= 0 {
-			hop.user, part = part[:at], part[at+1:]
-			if hop.user == "" {
-				return nil, fmt.Errorf("empty user in ProxyJump hop %q", raw)
-			}
-		}
-		host, port, err := splitHostPort(part)
-		if err != nil {
-			return nil, fmt.Errorf("ProxyJump hop %q: %w", raw, err)
-		}
-		hop.host, hop.port = host, port
-		if hop.host == "" {
-			return nil, fmt.Errorf("empty host in ProxyJump hop %q", raw)
-		}
-		hops = append(hops, hop)
+	if hop.Port == 0 {
+		hop.Port = 22
 	}
-	return hops, nil
-}
-
-// splitHostPort handles "host", "host:port", "[::1]" and "[::1]:port".
-func splitHostPort(s string) (string, int, error) {
-	if strings.HasPrefix(s, "[") {
-		end := strings.Index(s, "]")
-		if end < 0 {
-			return "", 0, fmt.Errorf("unclosed [ in %q", s)
-		}
-		host := s[1:end]
-		rest := s[end+1:]
-		if rest == "" {
-			return host, 0, nil
-		}
-		if !strings.HasPrefix(rest, ":") {
-			return "", 0, fmt.Errorf("trailing %q after ] in %q", rest, s)
-		}
-		p, err := strconv.Atoi(rest[1:])
-		if err != nil {
-			return "", 0, fmt.Errorf("port %q: %w", rest[1:], err)
-		}
-		return host, p, nil
+	if hop.Password == "" && hop.PrivateKeyFile == "" && hop.PrivateKeyBytes == nil && !hop.UseAgent {
+		hop.Password = target.Password
+		hop.PrivateKeyFile = target.PrivateKeyFile
+		hop.PrivateKeyBytes = target.PrivateKeyBytes
+		hop.PrivateKeyPassphrase = target.PrivateKeyPassphrase
+		hop.UseAgent = target.UseAgent
 	}
-	// A bare IPv6 address has more than one colon and no brackets: it
-	// cannot be told from host:port, and OpenSSH requires brackets too.
-	if strings.Count(s, ":") > 1 {
-		return "", 0, fmt.Errorf("IPv6 address %q must be bracketed", s)
+	if hop.KnownHostsFile == "" {
+		hop.KnownHostsFile = target.KnownHostsFile
 	}
-	if i := strings.LastIndex(s, ":"); i >= 0 {
-		p, err := strconv.Atoi(s[i+1:])
-		if err != nil {
-			return "", 0, fmt.Errorf("port %q: %w", s[i+1:], err)
-		}
-		return s[:i], p, nil
+	// HostKeyCheck is a bool with a meaningful false, so it cannot be
+	// told apart from "unset". It follows the target: a run that does
+	// not verify the target's key gains nothing from verifying the
+	// bastion's, and a run that does verify would otherwise be
+	// silently downgraded for the hop.
+	hop.HostKeyCheck = target.HostKeyCheck
+	if hop.Timeout == 0 {
+		hop.Timeout = target.Timeout
 	}
-	return s, 0, nil
+	// A hop is a tunnel, never a place commands run: it must not carry
+	// the target's ProxyJump (which would recurse) and has no use for
+	// its TempDir or TTY.
+	hop.ProxyJump = nil
+	hop.TempDir = ""
+	hop.TTY = false
+	return hop
 }
 
 // dialThroughJumps opens the ProxyJump chain and returns a dialer that
-// reaches the target from the last hop, plus the clients it opened so
-// the caller can close them with the connection.
-//
-// Each hop inherits the target's credentials and host-key policy,
-// overriding only what its own spec names. OpenSSH instead reads each
-// hop's settings from ssh_config; there is no ssh_config here, and
-// inheriting is what makes `-o ProxyJump=bastion` work with the key the
-// run already uses.
-func dialThroughJumps(ctx context.Context, cfg SSHConfig, hops []jumpHop) (func(context.Context, string, string) (net.Conn, error), []*SSH, error) {
+// reaches the target from the last hop, plus the connections it opened
+// so the caller can close them with the target's.
+func dialThroughJumps(ctx context.Context, cfg SSHConfig) (func(context.Context, string, string) (net.Conn, error), []*SSH, error) {
 	var opened []*SSH
 	closeAll := func() {
 		for i := len(opened) - 1; i >= 0; i-- {
@@ -114,22 +66,17 @@ func dialThroughJumps(ctx context.Context, cfg SSHConfig, hops []jumpHop) (func(
 	// The first hop is reached the ordinary way; every later hop is
 	// reached THROUGH the one before it, which is the whole point.
 	dial := cfg.Dialer
-	for _, hop := range hops {
-		hopCfg := cfg
-		hopCfg.ProxyJump = "" // or this would recurse forever
-		hopCfg.Dialer = dial
-		hopCfg.Host = hop.host
-		hopCfg.Port = hop.port
-		if hop.user != "" {
-			hopCfg.User = hop.user
+	for _, raw := range cfg.ProxyJump {
+		hop := inheritJumpCredentials(raw, cfg)
+		hop.Dialer = dial
+		if hop.Host == "" {
+			closeAll()
+			return nil, nil, fmt.Errorf("a ProxyJump hop has no Host")
 		}
-		// A hop is a tunnel, not a place we run commands: its TempDir
-		// and TTY are irrelevant, and leaving them inherited is
-		// harmless.
-		hopSSH, err := DialSSH(ctx, hopCfg)
+		hopSSH, err := DialSSH(ctx, hop)
 		if err != nil {
 			closeAll()
-			return nil, nil, fmt.Errorf("via %s: %w", net.JoinHostPort(hop.host, strconv.Itoa(hopCfg.Port)), err)
+			return nil, nil, fmt.Errorf("via %s: %w", net.JoinHostPort(hop.Host, strconv.Itoa(hop.Port)), err)
 		}
 		opened = append(opened, hopSSH)
 		client := hopSSH.client

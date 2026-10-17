@@ -42,17 +42,25 @@ type SSHConfig struct {
 	// server that refuses it does not fail the command).
 	TTY bool
 
-	// ProxyJump reaches the target THROUGH one or more bastions, in
-	// OpenSSH's own -J syntax: [user@]host[:port], comma separated for
-	// a chain, dialled left to right. "none" disables it, as it does
-	// in ssh_config.
+	// ProxyJump reaches the target THROUGH one or more bastions,
+	// dialled in order: the first the ordinary way, each later one
+	// through the previous, and the last one carrying the target's own
+	// handshake.
 	//
-	// Each hop inherits this config's credentials and host-key policy,
-	// overriding only what its own spec names. OpenSSH reads each hop's
-	// settings from ssh_config instead; there is none here, and
-	// inheriting is what lets `-o ProxyJump=bastion` work with the key
-	// the run already has.
-	ProxyJump string
+	// Hops are given already resolved rather than as OpenSSH's
+	// `[user@]host[:port]` string, because the caller is what knows the
+	// syntax it came from -- go-ansible/playbook parses
+	// `ansible_ssh_common_args: -o ProxyJump=...` along with the rest
+	// of that option surface, and a second parser here would be one to
+	// keep in step for nothing.
+	//
+	// A hop need only name its Host; User defaults to the target's and
+	// Port to 22, and a hop that names no credential of its own
+	// inherits the target's, which is what makes a bare
+	// `-o ProxyJump=bastion` work with the key the run already has. A
+	// hop that DOES name its own key keeps it. See
+	// inheritJumpCredentials.
+	ProxyJump []SSHConfig
 
 	Timeout time.Duration // default 30s
 
@@ -133,18 +141,15 @@ func DialSSH(ctx context.Context, cfg SSHConfig) (*SSH, error) {
 
 	addr := net.JoinHostPort(cfg.Host, fmt.Sprintf("%d", cfg.Port))
 
-	hops, err := parseProxyJump(cfg.ProxyJump)
-	if err != nil {
-		return nil, fmt.Errorf("transport: %w", err)
-	}
 	dial := cfg.Dialer
 	var jumps []*SSH
-	if len(hops) > 0 {
+	if len(cfg.ProxyJump) > 0 {
 		// The last hop's client becomes the dialer for the target, so
 		// the target's own handshake happens inside the tunnel.
-		dial, jumps, err = dialThroughJumps(ctx, cfg, hops)
-		if err != nil {
-			return nil, fmt.Errorf("transport: ProxyJump: %w", err)
+		var jerr error
+		dial, jumps, jerr = dialThroughJumps(ctx, cfg)
+		if jerr != nil {
+			return nil, fmt.Errorf("transport: ProxyJump: %w", jerr)
 		}
 	}
 	if dial == nil {
